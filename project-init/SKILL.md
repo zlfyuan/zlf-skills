@@ -170,11 +170,11 @@ project-root/
 ├── CLAUDE.md                 # Claude Code 项目指令
 ├── AGENTS.md                 # Codex / 其他代理 项目指令
 ├── .claude/
-│   ├── settings.local.json   # 项目级权限配置 + plansDirectory
+│   ├── settings.local.json   # 项目级权限配置 + plansDirectory（预留字段，当前不生效）
 │   ├── rules/                # 项目规则目录
 │   ├── skills/               # 项目级技能目录
 │   ├── commands/             # 自定义命令目录
-│   ├── plans/                # Plan 模式计划存档 (替代 ~/.claude/plans/)
+│   ├── plans/                # Plan 模式计划存档（由镜像规则填充）
 │   ├── progress/             # 🌀 自主开发状态追踪
 │   │   ├── README.md         #   总索引（Stage 列表 + 进度统计）
 │   │   ├── stage-001.md      #   阶段文件（目标/子任务/执行日志）
@@ -184,6 +184,30 @@ project-root/
 │   └── AGENTS.md             # Codex 目录级指令
 └── .codegraph/               # CodeGraph 索引数据 (由 codegraph init 创建)
 ```
+
+### 📋 Plan 文件镜像规则（自动注入）
+
+harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**不在项目内**，git 无法追踪）。即使项目级 `settings.local.json` 配置了 `plansDirectory`，**当前 Claude Code 版本不读取该字段**（已实测：cc-switch 项目的 `.claude/plans/` 为空，而 `~/.claude/plans/` 有 13 个文件）。
+
+因此 setup-project.sh 会在 `CLAUDE.md`、`AGENTS.md`、`.codex/AGENTS.md` 三个文件末尾**自动注入 Plan 镜像规则**，告诉 Agent：
+
+1. 从 plan mode system message 拿到 plan 的 `file_path`（绝对路径）
+2. `mkdir -p .claude/plans`
+3. `cp <file_path> .claude/plans/$(basename <file_path>)`
+4. 在副本末尾追加 `<!-- mirror source: <file_path> -->`
+5. **完成上述 4 步之后再调用 ExitPlanMode**
+
+`settings.local.json` 里的 `plansDirectory` 字段保留，作为 forward-compat 字段，等未来 harness 支持时自动生效。
+
+### 已有项目迁移
+
+对**已存在** `CLAUDE.md`/`AGENTS.md` 的项目（`setup-project.sh` 默认 `[KEEP]` 不动），运行：
+
+```bash
+bash scripts/inject-plan-mirror.sh /path/to/project
+```
+
+会把镜像规则追加到末尾，已有内容不改动。带 `--dry-run` 预览不写盘。
 
 ### 默认 settings.local.json 权限
 
@@ -213,6 +237,7 @@ project-root/
 | `scripts/auto-init.sh` | Hook 入口，协调检测和初始化 | 0=完成/已初始化, 1=非代码项目, 2=错误 |
 | `scripts/detect-code-project.sh` | 检测目录是否是编程项目 | 0=是, 1=否 |
 | `scripts/setup-project.sh` | 执行完整的项目初始化 | 0=成功, 1=失败 |
+| `scripts/inject-plan-mirror.sh` | 把 Plan 镜像规则追加到已有项目的 `CLAUDE.md`/`AGENTS.md` 末尾 | 0=全部成功, 1=部分失败, 2=参数错误 |
 
 ## 判断「编程项目」的标准
 

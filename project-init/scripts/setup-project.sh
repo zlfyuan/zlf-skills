@@ -201,6 +201,20 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## Architecture
 
 <!-- TODO: Document key architectural decisions and patterns -->
+
+## Plan 文件镜像（重要）
+
+harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径，不在项目内），无法被 git 追踪。
+为保证 `.claude/plans/` 里有项目级副本，**每次调用 `ExitPlanMode` 之前必须先执行以下步骤**：
+
+1. 从 plan mode 的 system message 里拿到 plan 的 `file_path`（绝对路径，harness 会告知）
+2. `mkdir -p .claude/plans`
+3. `cp <file_path> .claude/plans/$(basename <file_path>)`
+4. 用 Edit 在副本末尾追加一行：`<!-- mirror source: <file_path> -->`
+5. **完成上述 4 步之后再调用 `ExitPlanMode`**
+
+不执行镜像会让 plan 文件留在系统 `~/.claude/plans/` 里，项目级 `.claude/plans/` 始终为空。
+注：`settings.local.json` 里的 `plansDirectory` 字段是预留配置，当前 harness 版本不读取，仍需通过本规则手动镜像。
 CLAUDE_EOF
     CREATED=$((CREATED + 1))
 else
@@ -313,6 +327,19 @@ This file provides guidance to Codex and other coding agents when working in thi
 ## Architecture
 
 <!-- TODO: Document key architectural decisions and patterns -->
+
+## Plan 文件镜像（重要）
+
+harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径，不在项目内），无法被 git 追踪。
+为保证 `.claude/plans/` 里有项目级副本，**每次退出 plan 模式之前必须先执行以下步骤**：
+
+1. 从 plan mode 的 system message 里拿到 plan 的 `file_path`（绝对路径）
+2. `mkdir -p .claude/plans`
+3. `cp <file_path> .claude/plans/$(basename <file_path>)`
+4. 在副本末尾追加一行：`<!-- mirror source: <file_path> -->`
+5. **完成上述 4 步之后再退出 plan 模式**
+
+注：`settings.local.json` 里的 `plansDirectory` 字段是预留配置，当前 harness 版本不读取，仍需通过本规则手动镜像。
 AGENTS_EOF
     CREATED=$((CREATED + 1))
 else
@@ -329,6 +356,18 @@ if [[ ! -f "$CODEX_AGENTS" ]]; then
 
 <!-- Add project-specific instructions for Codex here -->
 <!-- This file is read by Codex when working in this project -->
+
+## Plan 文件镜像
+
+harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径）。退出 plan 模式之前必须把副本镜像到 `.claude/plans/`，步骤：
+
+1. 从 plan mode 的 system message 拿到 plan 的 `file_path`（绝对路径）
+2. `mkdir -p .claude/plans`
+3. `cp <file_path> .claude/plans/$(basename <file_path>)`
+4. 在副本末尾追加 `<!-- mirror source: <file_path> -->`
+5. 完成后再退出 plan 模式
+
+`plansDirectory` 字段当前不生效，必须靠本规则手动镜像。
 CODEX_EOF
     CREATED=$((CREATED + 1))
 else
