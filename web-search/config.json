@@ -1,0 +1,29 @@
+{
+  "name": "web-search",
+  "description": "网络搜索与网页内容获取 - 使用 curl 访问百度、必应、谷歌搜索结果",
+  "version": "1.0.0",
+  "author": "claude",
+  "trigger": "/搜索",
+  "slots": [
+    {
+      "name": "query",
+      "type": "string",
+      "description": "搜索关键词",
+      "required": true
+    },
+    {
+      "name": "engine",
+      "type": "string",
+      "description": "搜索引擎：google(默认)、bing、baidu",
+      "required": false
+    }
+  ],
+  "examples": [
+    "/搜索 今天是几号",
+    "/搜索 python教程 google",
+    "/搜索 特斯拉最新消息 bing",
+    "/搜索 微博热搜 baidu"
+  ],
+  "tags": ["搜索", "网络", "上网", "查询", "curl", "网页"],
+  "category": "utility"
+}

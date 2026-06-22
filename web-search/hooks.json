@@ -1,0 +1,10 @@
+{
+  "invocations": [
+    {
+      "hook": "always",
+      "prompt_file": "prompt.md"
+    }
+  ],
+  "keywords": ["网络搜索", "上网", "网络查询", "看看这个url", "文章", "搜索一下", "帮我搜", "帮我查", "查一下", "搜一下", "去网上找", "网上搜"],
+  "auto_trigger": false
+}
