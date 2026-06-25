@@ -126,6 +126,7 @@ fi
 check_file "CLAUDE.md"                      "CLAUDE.md"                      || true
 check_file "AGENTS.md"                      "AGENTS.md"                      || true
 check_file ".codex/AGENTS.md"               ".codex/AGENTS.md"               || true
+check_file ".gitignore"                     ".gitignore"                     || true
 check_file ".claude/settings.local.json"    ".claude/settings.local.json"    || true
 
 # Audit codegraph
@@ -177,6 +178,30 @@ mkdir -p "$TARGET/.claude/plans"
 mkdir -p "$TARGET/.claude/progress"
 mkdir -p "$TARGET/.codex"
 
+# ── .gitignore ─────────────────────────────────────────────────────────
+GITIGNORE_FILE="$TARGET/.gitignore"
+if [[ ! -f "$GITIGNORE_FILE" ]]; then
+    echo "  [NEW] Creating .gitignore..."
+    cat > "$GITIGNORE_FILE" << 'GITIGNORE_EOF'
+# project-init generated local agent files
+.claude/
+.codex/
+.codegraph/
+CLAUDE.md
+AGENTS.md
+GITIGNORE_EOF
+    CREATED=$((CREATED + 1))
+else
+    echo "  [MERGE] .gitignore — adding missing ignore rules..."
+    touch "$GITIGNORE_FILE"
+    for entry in '.claude/' '.codex/' '.codegraph/' 'CLAUDE.md' 'AGENTS.md'; do
+        if ! grep -Fxq "$entry" "$GITIGNORE_FILE"; then
+            printf '%s\n' "$entry" >> "$GITIGNORE_FILE"
+        fi
+    done
+    SKIPPED=$((SKIPPED + 1))
+fi
+
 # ── CLAUDE.md ────────────────────────────────────────────────────────────
 CLAUDE_MD="$TARGET/CLAUDE.md"
 if [[ ! -f "$CLAUDE_MD" ]]; then
@@ -184,23 +209,28 @@ if [[ ! -f "$CLAUDE_MD" ]]; then
     cat > "$CLAUDE_MD" << 'CLAUDE_EOF'
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+This file provides working guidance for Claude Code when contributing to this repository.
 
 ## Project Overview
 
-<!-- TODO: Add a brief description of your project -->
+- Describe the repository purpose and primary user workflow.
+- Keep this file focused on project-specific context that helps future sessions.
+
+## Working Rules
+
+- Prefer small, verifiable changes over broad refactors.
+- Run the relevant build, test, or lint commands before declaring work complete.
+- Document non-obvious decisions in the repository when they matter for future maintenance.
 
 ## Build & Test Commands
 
-<!-- TODO: Add build, test, and lint commands -->
+- Add the repository-specific commands for install, build, test, and lint here.
+- Use the project's existing scripts whenever possible.
 
-## Code Style
+## Notes
 
-<!-- TODO: Add code style guidelines -->
-
-## Architecture
-
-<!-- TODO: Document key architectural decisions and patterns -->
+- This file is created by project-init and can be customized as the project evolves.
+- Keep the Plan mirror instructions below if you rely on plan-mode workflows.
 
 ## Plan 文件镜像（重要）
 
@@ -310,23 +340,23 @@ if [[ ! -f "$AGENTS_MD" ]]; then
     cat > "$AGENTS_MD" << 'AGENTS_EOF'
 # AGENTS.md
 
-This file provides guidance to Codex and other coding agents when working in this repository.
+This file provides guidance to Codex and other coding agents working in this repository.
 
 ## Project Overview
 
-<!-- TODO: Add a brief description of your project -->
+- Describe the repository purpose and the main workflows for contributors.
+- Keep instructions focused on reliable, low-risk changes.
+
+## Working Expectations
+
+- Prefer existing project conventions over introducing new patterns.
+- Validate changes with the project's relevant test or build commands.
+- Call out risky assumptions or missing context when they affect implementation.
 
 ## Build & Test Commands
 
-<!-- TODO: Add build, test, and lint commands -->
-
-## Code Style
-
-<!-- TODO: Add code style guidelines -->
-
-## Architecture
-
-<!-- TODO: Document key architectural decisions and patterns -->
+- Add the repository-specific commands for install, build, test, and lint here.
+- Prefer invoking the existing scripts or package-manager tasks.
 
 ## Plan 文件镜像（重要）
 
@@ -354,8 +384,12 @@ if [[ ! -f "$CODEX_AGENTS" ]]; then
     cat > "$CODEX_AGENTS" << 'CODEX_EOF'
 # Codex Project Instructions
 
-<!-- Add project-specific instructions for Codex here -->
-<!-- This file is read by Codex when working in this project -->
+This file is read by Codex when working in this project.
+
+## Project Notes
+
+- Add repo-specific expectations here so Codex follows the same conventions as human contributors.
+- Prefer the project's existing commands and architecture over introducing bespoke workflows.
 
 ## Plan 文件镜像
 
