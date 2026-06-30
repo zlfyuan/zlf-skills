@@ -167,7 +167,7 @@ description: >
 
 ```
 project-root/
-├── CLAUDE.md                 # Claude Code 项目指令
+├── CLAUDE.md                 # Claude Code 项目指令（由 `claude /init` 生成，见下）
 ├── AGENTS.md                 # Codex / 其他代理 项目指令
 ├── .claude/
 │   ├── settings.local.json   # 项目级权限配置 + plansDirectory（预留字段，当前不生效）
@@ -185,6 +185,50 @@ project-root/
 └── .codegraph/               # CodeGraph 索引数据 (由 codegraph init 创建)
 ```
 
+### 🧠 CLAUDE.md 生成：调用 `claude /init`
+
+`CLAUDE.md` **不是** project-init 自己写的占位模板，而是由 `claude /init`
+（Claude Code 内置的「分析当前代码库并生成 CLAUDE.md」斜杠命令）生成的代码库感知内容，
+最后再由 project-init 把 Plan 镜像规则追加到末尾。
+
+**调用方式**（`setup-project.sh` 在 CLAUDE.md 不存在时自动执行）：
+
+```bash
+cd "$TARGET" && \
+claude --bare --dangerously-skip-permissions \
+  --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*),Bash(head:*)" \
+  -p "/init" < /dev/null
+```
+
+**每个 flag 为什么必须：**
+
+- **`--bare`** — 不加的话，subprocess 会触发用户的 `SessionStart` hook，
+  而 hook 链上就是 `auto-init.sh → setup-project.sh`，会先把占位 CLAUDE.md 写好，
+  导致 `/init` 申请 `Write` 时被拒。`--bare` 跳过 hooks（以及 CLAUDE.md auto-discovery
+  等副作用），让 `/init` 在干净环境里跑。
+- **`--dangerously-skip-permissions`** — `-p` 模式下 Write / Edit / Bash 默认需要
+  permission prompt（无 TTY 时直接失败），加上这个 flag 才会让 `/init` 真正能落盘。
+  这是 `-p` 模式推荐的标准做法（`claude --help` 明确推荐 sandbox 内用）。
+- **`< /dev/null`** — 后台 + 输出重定向时 stdin 不是 TTY，claude 会报
+  "Warning: no stdin data received in 3s" 然后退出 0 不写文件。显式喂空 stdin 解决。
+- **`--allowedTools "Write,..."`** — 显式列出 /init 需要的工具子集，避免依赖默认 allowlist。
+
+**超时：** 180s（`/init` 对小项目 < 30s，大仓库很少超过 2 分钟）。
+
+**回退策略：** 如果 `claude` CLI 没装、`/init` 退出非零、超时、
+或产物太小 / 仍含占位文本，则回退到带明显占位说明的 heredoc，
+并在文件里告诉用户如何手动重跑 `claude /init` 覆盖。
+
+**手动重跑覆盖（任何时候）：**
+
+```bash
+claude --bare --dangerously-skip-permissions \
+  --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*)" \
+  -p "/init" < /dev/null
+# 然后再跑一次 setup-project.sh 让 Plan 镜像规则被补上：
+bash scripts/setup-project.sh "$TARGET"
+```
+
 ### 📋 Plan 文件镜像规则（自动注入）
 
 harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**不在项目内**，git 无法追踪）。即使项目级 `settings.local.json` 配置了 `plansDirectory`，**当前 Claude Code 版本不读取该字段**（已实测：cc-switch 项目的 `.claude/plans/` 为空，而 `~/.claude/plans/` 有 13 个文件）。
@@ -197,17 +241,36 @@ harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**不在项
 4. 在副本末尾追加 `<!-- mirror source: <file_path> -->`
 5. **完成上述 4 步之后再调用 ExitPlanMode**
 
+**何时自动注入：**
+
+| 场景 | 行为 |
+|------|------|
+| 文件不存在 | `[NEW]` 创建并嵌入完整 Plan 镜像规则 |
+| 文件已包含 Plan 镜像规则 | `[KEEP]` 原样保留 |
+| 文件存在但**缺少** Plan 镜像规则 | `[KEEP]` 主体内容 + 追加镜像规则（如 `/init` 创建的 CLAUDE.md） |
+
 `settings.local.json` 里的 `plansDirectory` 字段保留，作为 forward-compat 字段，等未来 harness 支持时自动生效。
 
-### 已有项目迁移
+### 已有项目迁移（手动工具）
 
-对**已存在** `CLAUDE.md`/`AGENTS.md` 的项目（`setup-project.sh` 默认 `[KEEP]` 不动），运行：
+`setup-project.sh` 已经会在 `[KEEP]` 分支自动追加 Plan 镜像规则，覆盖绝大多数迁移场景。仅在以下情况手动运行 `inject-plan-mirror.sh`：
+
+- **批量迁移**：用 `--recursive` 扫描一棵目录树（含 `.claude/` 的子目录全部处理）
+- **预览**：用 `--dry-run` 看会改哪些文件，不实际写盘
+- **CI / 定时任务**：在 setup-project.sh 之外的钩子里调用
 
 ```bash
+# 单项目
 bash scripts/inject-plan-mirror.sh /path/to/project
+
+# 预览
+bash scripts/inject-plan-mirror.sh --dry-run /path/to/project
+
+# 递归扫描
+bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase
 ```
 
-会把镜像规则追加到末尾，已有内容不改动。带 `--dry-run` 预览不写盘。
+规则块文本与注入函数从 `scripts/plan-mirror-rules.sh` 复用 —— setup-project.sh 和 inject-plan-mirror.sh 共用同一份逻辑，新老项目拿到的规则永远一致。
 
 ### 默认 settings.local.json 权限
 
@@ -237,7 +300,9 @@ bash scripts/inject-plan-mirror.sh /path/to/project
 | `scripts/auto-init.sh` | Hook 入口，协调检测和初始化 | 0=完成/已初始化, 1=非代码项目, 2=错误 |
 | `scripts/detect-code-project.sh` | 检测目录是否是编程项目 | 0=是, 1=否 |
 | `scripts/setup-project.sh` | 执行完整的项目初始化 | 0=成功, 1=失败 |
-| `scripts/inject-plan-mirror.sh` | 把 Plan 镜像规则追加到已有项目的 `CLAUDE.md`/`AGENTS.md` 末尾 | 0=全部成功, 1=部分失败, 2=参数错误 |
+| `scripts/teardown-project.sh` | 反向操作：清理 setup 创建的所有产物 | 0=清理完成, 1=无产物/部分失败, 2=用户中止 |
+| `scripts/inject-plan-mirror.sh` | 批量迁移工具：把 Plan 镜像规则追加到已有项目的 `CLAUDE.md`/`AGENTS.md` 末尾 | 0=全部成功, 1=部分失败, 2=参数错误 |
+| `scripts/plan-mirror-rules.sh` | **共享 lib**：Plan 镜像规则块 + `pmr_inject` 函数（被 setup / inject 共同 source） | 不可直接执行 |
 
 ## 判断「编程项目」的标准
 
@@ -282,6 +347,45 @@ codegraph init
 # 查看 CodeGraph 状态
 codegraph status
 ```
+
+## 卸载 / 清理（teardown）
+
+`teardown-project.sh` 是 `setup-project.sh` 的对偶脚本：移除 project-init 在项目中创建的所有产物，让目录回到 setup 之前的状态。
+
+**清理范围：**
+
+- `.claude/` 整个目录（包含 `settings.local.json`、`progress/`、`plans/`、`skills/`、`rules/`、`commands/`、`.init-done` 等）
+- `.codex/` 整个目录
+- `.codegraph/` 整个目录（已尝试 `codegraph clean`）
+- 根目录 `CLAUDE.md` / `AGENTS.md` —— **仅当**内容匹配 project-init 模板指纹（包含 `This file provides working guidance…` + `## Plan 文件镜像` 等独有片段）；用户改过的版本会保留并提示
+- `.gitignore` —— 精确剥离 `# project-init generated local agent files` 块；如果整文件都是 setup 创建的，直接删除整文件
+- `.claude/settings.local.json` —— **默认保留**（合并了用户权限），加 `--purge-config` 才会在指纹匹配时删除
+
+**使用示例：**
+
+```bash
+# 交互式（默认会逐项确认）
+bash scripts/teardown-project.sh
+
+# 跳过所有确认
+bash scripts/teardown-project.sh --yes
+
+# 仅审计，不实际删除
+bash scripts/teardown-project.sh --dry-run
+
+# 保留根 CLAUDE.md / AGENTS.md / settings.local.json
+bash scripts/teardown-project.sh --keep-config
+
+# 删除前先打包备份到项目根
+bash scripts/teardown-project.sh --backup --yes
+```
+
+**安全策略：**
+
+- 默认对每个可能被用户改过的文件做指纹识别，不匹配就跳过
+- `--yes` 才删除无指纹的"用户内容"文件，且会单独打印 ⚠ 警告
+- `--dry-run` 始终安全，只打印审计结果
+- 退出码 2 表示用户中止了 prompt
 
 ## ⚠️ 增量原则（Additive-Only）
 

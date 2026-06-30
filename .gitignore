@@ -1,0 +1,6 @@
+# project-init generated local agent files
+.claude/
+.codex/
+.codegraph/
+CLAUDE.md
+AGENTS.md

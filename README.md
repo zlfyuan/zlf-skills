@@ -4,11 +4,11 @@
 
 ## 技能列表
 
-| 技能 | 说明 | 触发方式 |
-| --- | --- | --- |
-| [`karpathy-guidelines/`](./karpathy-guidelines/) | 来自 Andrej Karpathy 总结的 LLM 编码行为准则：编码前先思考、简洁优先、外科手术式改动、目标驱动执行 | 写代码 / 评审 / 重构时自动参考 |
-| [`project-init/`](./project-init/) | 自动检测并初始化编程项目，配置 `.claude/` / `.codex/` 目录、CLAUDE.md / AGENTS.md、默认权限、CodeGraph MCP，并维护 `.claude/progress/` 状态追踪 | 启动 Claude Code / Codex、`/loop`、`/goal`，或关键词 `init project` / `初始化项目` / `自主开发` |
-| [`web-search/`](./web-search/) | 基于 `curl` 的网络搜索与网页抓取，Google → Bing → Baidu 顺序回退，自动处理反爬 | `/搜索 <关键词> [搜索引擎]` |
+| 技能 | 一句话 | 触发方式 | 详细 |
+| --- | --- | --- | --- |
+| [`karpathy-guidelines/`](./karpathy-guidelines/) | LLM 编码行为准则：编码前先思考、简洁优先、外科手术式改动、目标驱动执行 | 写代码 / 评审 / 重构时自动参考 | [README](./karpathy-guidelines/README.md) |
+| [`project-init/`](./project-init/) | 自动检测并初始化编程项目，配置 `.claude/` / `.codex/` 目录、CLAUDE.md / AGENTS.md、默认权限、CodeGraph MCP，并维护 `.claude/progress/` 状态追踪 | 启动 Claude Code / Codex、`/loop`、`/goal`，或关键词 `init project` / `初始化项目` / `自主开发` | [README](./project-init/README.md) |
+| [`web-search/`](./web-search/) | 基于 `curl` 的网络搜索与网页抓取，Google → Bing → Baidu 顺序回退，自动处理反爬 | `/搜索 <关键词> [搜索引擎]` | [README](./web-search/README.md) |
 
 ## 安装
 
