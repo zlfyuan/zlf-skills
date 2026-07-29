@@ -28,6 +28,17 @@ fi
 [[ -n "${PMR_LOADED:-}" ]] && return 0
 PMR_LOADED=1
 
+# ── 同时 source 共享的 ci-path 助手（pmr_inject 要用 ci_resolve） ─────────
+# 如果调用方已经 source 过，bash 不会重复执行（lib 自身有 PMR_LOADED guard 类似机制）
+_PMR_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 避免重复 source 时重定义 TARGET / ci_* 函数 —— 用变量 guard
+if [[ -z "${_CI_PATH_SOURCED:-}" ]]; then
+    # shellcheck disable=SC1091
+    source "$_PMR_SCRIPT_DIR/ci-path.sh"
+    export _CI_PATH_SOURCED=1
+fi
+unset _PMR_SCRIPT_DIR
+
 # ── 规则块（与 setup-project.sh heredoc 内容同步）──────────────────────
 read -r -d '' PMR_CLAUDE_BLOCK <<'BLOCK' || true
 
@@ -92,11 +103,13 @@ pmr_block_for() {
 
 # ── pmr_inject <project_dir> <rel_path> [block] ─────────────────────────
 # 把规则块追加到 <project>/<rel_path>（如果尚未包含）。
-#   $1 — 项目根目录
+#   $1 — 项目根目录（绝对路径）
 #   $2 — 相对路径（CLAUDE.md / AGENTS.md / .codex/AGENTS.md）
 #   $3 — (可选) 显式规则块；空则按 rel_path 自动选择
 # Env:
 #   DRY_RUN=true — 只打印，不写盘
+# 大小写不敏感：<rel_path> 写成 canonical 小写，但实际打开时先按 on-disk 实际名解析，
+# 避免在 `.Codex/` 这种用户手建变体上失败。
 pmr_inject() {
     local project="$1"
     local rel_path="$2"
@@ -107,7 +120,21 @@ pmr_inject() {
         return 3
     fi
 
-    local full_path="$project/$rel_path"
+    # 大小写不敏感解析 <rel_path>：把 TARGET bind 到 $project，
+    # 逐段去找用户磁盘上的实际大小写（例如 .Codex/AGENTS.md）
+    local TARGET="$project" resolved_path
+    if resolved_path="$(ci_resolve "$rel_path" 2>/dev/null)" && [[ -n "$resolved_path" ]]; then
+        local full_path="$project/$resolved_path"
+    else
+        # 不存在（既不是规范小写也不是大小写变体），就按字面拼出路径
+        # —— 这样如果调用方刚把文件创建好（setup / write）也能继续
+        local full_path="$project/$rel_path"
+        # 真没有就提前退出
+        if [[ ! -f "$full_path" ]]; then
+            echo "    ⊘ $rel_path — 不存在，跳过"
+            return 2
+        fi
+    fi
 
     if [[ ! -f "$full_path" ]]; then
         echo "    ⊘ $rel_path — 不存在，跳过"

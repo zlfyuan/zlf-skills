@@ -17,10 +17,11 @@ TARGET="${1:-$PWD}"
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ── Source shared Plan mirror rules (lib) ───────────────────────────────
-# 让 setup-project.sh 能复用 inject-plan-mirror.sh 的规则块文本与注入逻辑。
-# 新文件仍用 heredoc 一次性写入（更快），已有文件 [KEEP] 时再调用 pmr_inject 追加。
+# ── Source shared Plan mirror rules + case-insensitive path lib ─────────
+# plan-mirror-rules.sh: 让 setup 与 inject 复用同一份规则块与注入逻辑。
+# ci-path.sh:           在大小写敏感 FS 上复用用户的 .Claude / .Codex 等变体。
 source "$SCRIPT_DIR/plan-mirror-rules.sh"
+source "$SCRIPT_DIR/ci-path.sh"
 
 # ── Default permissions to ensure ───────────────────────────────────────
 # These are the recommended permissions. If settings.local.json already
@@ -46,8 +47,7 @@ DEFAULT_PERMISSIONS=(
     "Bash(cmake:*)"
     "Bash(xcodebuild:*)"
     "Bash(swift:*)"
-    "Bash(git:*)"
-    "Bash(curl:*)"
+    # Git, network, and unrestricted file permissions remain prompt-gated.
     "Bash(codegraph:*)"
     "Bash(ls:*)"
     "Bash(cat:*)"
@@ -58,11 +58,6 @@ DEFAULT_PERMISSIONS=(
     "Bash(echo:*)"
     "Bash(mkdir:*)"
     "Bash(cd:*)"
-    "Read(*)"
-    "Edit(*)"
-    "Write(*)"
-    "WebFetch(*)"
-    "WebSearch(*)"
 )
 
 echo "🔧 Setting up project: $TARGET"
@@ -86,8 +81,10 @@ AUDIT_EXISTING=()
 check_file() {
     local path="$1"
     local label="$2"
-    if [[ -f "$TARGET/$path" ]]; then
-        AUDIT_EXISTING+=("  ✓ $label — already exists")
+    local resolved
+    # ci_resolve 返回非 0 表示「大小写不敏感也都找不到」，用 || true 兜底 set -e
+    if resolved="$(ci_resolve "$path" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+        AUDIT_EXISTING+=("  ✓ $label — already exists (at $resolved)")
         return 1
     else
         AUDIT_NEW+=("  + $label — will create")
@@ -98,8 +95,9 @@ check_file() {
 check_dir() {
     local path="$1"
     local label="$2"
-    if [[ -d "$TARGET/$path" ]]; then
-        AUDIT_EXISTING+=("  ✓ $label/ — already exists")
+    local resolved
+    if resolved="$(ci_resolve "$path" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+        AUDIT_EXISTING+=("  ✓ $label/ — already exists (at $resolved/)")
         return 1
     else
         AUDIT_NEW+=("  + $label/ — will create")
@@ -117,13 +115,13 @@ check_dir ".claude/progress"     ".claude/progress"     || true
 check_dir ".codex"               ".codex"               || true
 
 # Audit progress files individually
-if [[ -f "$TARGET/.claude/progress/README.md" ]]; then
-    AUDIT_EXISTING+=("  ✓ .claude/progress/README.md — already exists")
+if resolved="$(ci_resolve ".claude/progress/README.md" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+    AUDIT_EXISTING+=("  ✓ .claude/progress/README.md — already exists (at $resolved)")
 else
     AUDIT_NEW+=("  + .claude/progress/README.md — will create")
 fi
-if [[ -f "$TARGET/.claude/progress/problems.md" ]]; then
-    AUDIT_EXISTING+=("  ✓ .claude/progress/problems.md — already exists")
+if resolved="$(ci_resolve ".claude/progress/problems.md" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+    AUDIT_EXISTING+=("  ✓ .claude/progress/problems.md — already exists (at $resolved)")
 else
     AUDIT_NEW+=("  + .claude/progress/problems.md — will create")
 fi
@@ -134,10 +132,11 @@ check_file "AGENTS.md"                      "AGENTS.md"                      || 
 check_file ".codex/AGENTS.md"               ".codex/AGENTS.md"               || true
 check_file ".gitignore"                     ".gitignore"                     || true
 check_file ".claude/settings.local.json"    ".claude/settings.local.json"    || true
+check_file ".claude/memory/MEMORY.md"       ".claude/memory/MEMORY.md"       || true
 
 # Audit codegraph
-if [[ -d "$TARGET/.codegraph" ]]; then
-    AUDIT_EXISTING+=("  ✓ .codegraph/ — already initialized")
+if resolved="$(ci_resolve ".codegraph" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+    AUDIT_EXISTING+=("  ✓ .codegraph/ — already initialized (at $resolved/)")
 else
     AUDIT_NEW+=("  + .codegraph/ — will run codegraph init")
 fi
@@ -156,6 +155,13 @@ fi
 echo ""
 echo "   Missing (will CREATE):"
 if [[ ${#AUDIT_NEW[@]} -eq 0 ]]; then
+    # A project can already contain all generated artifacts without the
+    # initialization marker (for example after a manual migration). Ensure the
+    # marker is written so SessionStart hooks do not audit it every time.
+    EXISTING_CLAUDE_DIR="$(ci_canon .claude)"
+    if [[ ! -f "$TARGET/$EXISTING_CLAUDE_DIR/.init-done" ]]; then
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TARGET/$EXISTING_CLAUDE_DIR/.init-done"
+    fi
     echo "     (nothing — project already fully initialized)"
     echo ""
     echo "✅ Project already fully set up. Nothing to do."
@@ -175,17 +181,58 @@ echo "🔨 Phase 2: Create missing items"
 CREATED=0
 SKIPPED=0
 
+# ── Resolve top-level entry names case-insensitively ──────────────────
+# ci_canon returns the actual on-disk name if a case-variant already exists
+# (e.g. ".Claude"), otherwise the canonical lowercase form (e.g. ".claude").
+# All write targets below use these so we reuse user-existing dirs and never
+# create parallel sibling copies like `.claude/` next to a pre-existing `.Claude/`.
+CLAUDE_DIR="$(ci_canon .claude)"
+CODEX_DIR="$(ci_canon .codex)"
+CODEGRAPH_DIR="$(ci_canon .codegraph)"
+CLAUDE_MD="$TARGET/$(ci_canon CLAUDE.md)"
+AGENTS_MD="$TARGET/$(ci_canon AGENTS.md)"
+SETTINGS_LOCAL="$TARGET/$CLAUDE_DIR/settings.local.json"
+PROGRESS_README="$TARGET/$CLAUDE_DIR/progress/README.md"
+PROBLEMS_MD="$TARGET/$CLAUDE_DIR/progress/problems.md"
+MEMORY_INDEX="$TARGET/$CLAUDE_DIR/memory/MEMORY.md"
+INIT_STDERR_LOG="$TARGET/$CLAUDE_DIR/.init-stderr.log"
+GITIGNORE_FILE="$TARGET/$(ci_canon .gitignore)"
+MANIFEST="$TARGET/$CLAUDE_DIR/.project-init-manifest"
+CREATED_PATHS=()
+
+manifest_record() {
+    CREATED_PATHS+=("$1")
+}
+
+manifest_record_tree() {
+    local rel="$1"
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && manifest_record "$entry"
+    done < <(find "$TARGET/$rel" -mindepth 1 -print 2>/dev/null | sed "s#^$TARGET/##")
+    manifest_record "$rel"
+}
+
+ensure_dir() {
+    local full="$1"
+    local rel="$2"
+    if [[ ! -d "$full" ]]; then
+        mkdir -p "$full"
+        manifest_record "$rel"
+    fi
+}
+
 # ── Create missing directories (mkdir -p is idempotent, safe) ───────────
 echo "  → Ensuring directory structure..."
-mkdir -p "$TARGET/.claude/skills"
-mkdir -p "$TARGET/.claude/rules"
-mkdir -p "$TARGET/.claude/commands"
-mkdir -p "$TARGET/.claude/plans"
-mkdir -p "$TARGET/.claude/progress"
-mkdir -p "$TARGET/.codex"
+ensure_dir "$TARGET/$CLAUDE_DIR" "$CLAUDE_DIR"
+ensure_dir "$TARGET/$CLAUDE_DIR/skills" "$CLAUDE_DIR/skills"
+ensure_dir "$TARGET/$CLAUDE_DIR/rules" "$CLAUDE_DIR/rules"
+ensure_dir "$TARGET/$CLAUDE_DIR/commands" "$CLAUDE_DIR/commands"
+ensure_dir "$TARGET/$CLAUDE_DIR/plans" "$CLAUDE_DIR/plans"
+ensure_dir "$TARGET/$CLAUDE_DIR/progress" "$CLAUDE_DIR/progress"
+ensure_dir "$TARGET/$CLAUDE_DIR/memory" "$CLAUDE_DIR/memory"
+ensure_dir "$TARGET/$CODEX_DIR" "$CODEX_DIR"
 
 # ── .gitignore ─────────────────────────────────────────────────────────
-GITIGNORE_FILE="$TARGET/.gitignore"
 if [[ ! -f "$GITIGNORE_FILE" ]]; then
     echo "  [NEW] Creating .gitignore..."
     cat > "$GITIGNORE_FILE" << 'GITIGNORE_EOF'
@@ -196,6 +243,7 @@ if [[ ! -f "$GITIGNORE_FILE" ]]; then
 CLAUDE.md
 AGENTS.md
 GITIGNORE_EOF
+    manifest_record "$(basename "$GITIGNORE_FILE")"
     CREATED=$((CREATED + 1))
 else
     echo "  [MERGE] .gitignore — adding missing ignore rules..."
@@ -219,23 +267,20 @@ fi
 # 优先调用 `claude /init` 生成代码库感知的 CLAUDE.md，再追加 Plan 镜像规则。
 # /init 用 --bare 跳过 SessionStart hooks（避免 auto-init 递归写入占位文件）。
 # 失败时回退到带占位说明的 heredoc，并清楚提示用户。
-CLAUDE_MD="$TARGET/CLAUDE.md"
+# CLAUDE_MD / INIT_STDERR_LOG 已在 Phase 2 顶部用 ci_canon 解析（复用用户已有变体）
 INIT_OK=false
 
 if [[ ! -f "$CLAUDE_MD" ]]; then
     if command -v claude >/dev/null 2>&1; then
         echo "  [NEW] Generating CLAUDE.md via 'claude /init' (codebase-aware)..."
-        INIT_STDERR_LOG="$TARGET/.claude/.init-stderr.log"
         # 两个必须的 trick：
         # 1. `< /dev/null` —— 后台 + 输出重定向时 stdin 不是 TTY，claude 会报
         #    "Warning: no stdin data received in 3s" 然后退出 0 不写文件
-        # 2. `--dangerously-skip-permissions` —— `-p` 模式下 Write 等工具默认需要
-        #    permission prompt（无 TTY 时直接失败）。这是 `-p` 模式推荐的标准做法
-        #    （claude --help 明确推荐 sandbox 内用），且不改变 /init 行为，只是
-        #    跳过权限弹窗让 Write 真正能落盘
+        # 2. `--permission-mode acceptEdits` —— 允许 /init 写入 CLAUDE.md，
+        #    但不绕过其它工具的权限检查。
         (
             cd "$TARGET" && \
-            claude --bare --dangerously-skip-permissions \
+            claude --bare --permission-mode acceptEdits \
                 --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*),Bash(head:*)" \
                 -p "/init" < /dev/null
         ) > /dev/null 2> "$INIT_STDERR_LOG" &
@@ -267,6 +312,7 @@ if [[ ! -f "$CLAUDE_MD" ]]; then
             if [[ $SIZE -ge 500 ]] && ! grep -q "Describe the repository purpose" "$CLAUDE_MD" 2>/dev/null; then
                 echo "  ✓ CLAUDE.md generated by /init (${SIZE} bytes)"
                 INIT_OK=true
+                manifest_record "$(basename "$CLAUDE_MD")"
                 CREATED=$((CREATED + 1))
             else
                 echo "      ⚠ /init output too small or looks like placeholder (${SIZE} bytes); falling back"
@@ -326,6 +372,7 @@ harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径，�
 不执行镜像会让 plan 文件留在系统 `~/.claude/plans/` 里，项目级 `.claude/plans/` 始终为空。
 注：`settings.local.json` 里的 `plansDirectory` 字段是预留配置，当前 harness 版本不读取，仍需通过本规则手动镜像。
 CLAUDE_EOF
+        manifest_record "$(basename "$CLAUDE_MD")"
         CREATED=$((CREATED + 1))
     else
         # /init 成功了：把 Plan 镜像规则追加到末尾（/init 不会写这个）
@@ -343,14 +390,15 @@ else
 fi
 
 # ── settings.local.json (MERGE, not overwrite) ──────────────────────────
-SETTINGS_LOCAL="$TARGET/.claude/settings.local.json"
+# SETTINGS_LOCAL 已在 Phase 2 顶部用 ci_canon 解析
 if [[ ! -f "$SETTINGS_LOCAL" ]]; then
     echo "  [NEW] Creating .claude/settings.local.json..."
     # Build JSON with python3 for proper formatting
-    python3 -c "
-import json
+    CLAUDE_DIR="$CLAUDE_DIR" SETTINGS_LOCAL="$SETTINGS_LOCAL" python3 -c "
+import json, os
+# plansDirectory 必须匹配实际目录名（含用户的 case-variant）
 data = {
-    'plansDirectory': '.claude/plans',
+    'plansDirectory': os.environ['CLAUDE_DIR'] + '/plans',
     'permissions': {
         'allow': [
             'Bash(npm:*)', 'Bash(npx:*)', 'Bash(yarn:*)', 'Bash(pnpm:*)', 'Bash(bun:*)',
@@ -358,33 +406,33 @@ data = {
             'Bash(node:*)', 'Bash(go:*)', 'Bash(cargo:*)', 'Bash(rustc:*)',
             'Bash(javac:*)', 'Bash(mvn:*)', 'Bash(gradle:*)',
             'Bash(make:*)', 'Bash(cmake:*)', 'Bash(xcodebuild:*)', 'Bash(swift:*)',
-            'Bash(git:*)', 'Bash(curl:*)', 'Bash(codegraph:*)',
+            'Bash(codegraph:*)',
             'Bash(ls:*)', 'Bash(cat:*)', 'Bash(find:*)', 'Bash(grep:*)', 'Bash(wc:*)',
-            'Bash(which:*)', 'Bash(echo:*)', 'Bash(mkdir:*)', 'Bash(cd:*)',
-            'Read(*)', 'Edit(*)', 'Write(*)', 'WebFetch(*)', 'WebSearch(*)'
+            'Bash(which:*)', 'Bash(echo:*)', 'Bash(mkdir:*)', 'Bash(cd:*)'
         ]
     }
 }
-with open('$SETTINGS_LOCAL', 'w') as f:
+with open(os.environ['SETTINGS_LOCAL'], 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 "
+    manifest_record "$CLAUDE_DIR/settings.local.json"
     CREATED=$((CREATED + 1))
 else
     # Merge: add missing permissions + plansDirectory if absent
     echo "  [MERGE] .claude/settings.local.json — adding missing permissions..."
-    python3 -c "
-import json
+    CLAUDE_DIR="$CLAUDE_DIR" SETTINGS_LOCAL="$SETTINGS_LOCAL" python3 -c "
+import json, os
 
-with open('$SETTINGS_LOCAL', 'r') as f:
+with open(os.environ['SETTINGS_LOCAL'], 'r') as f:
     data = json.load(f)
 
 # Track what we added
 added = []
 
-# Ensure plansDirectory
+# Ensure plansDirectory matches the actual on-disk CLAUDE_DIR case
 if 'plansDirectory' not in data:
-    data['plansDirectory'] = '.claude/plans'
+    data['plansDirectory'] = os.environ['CLAUDE_DIR'] + '/plans'
     added.append('plansDirectory')
 
 # Ensure permissions.allow exists
@@ -398,10 +446,9 @@ recommended = [
     'Bash(node:*)', 'Bash(go:*)', 'Bash(cargo:*)', 'Bash(rustc:*)',
     'Bash(javac:*)', 'Bash(mvn:*)', 'Bash(gradle:*)',
     'Bash(make:*)', 'Bash(cmake:*)', 'Bash(xcodebuild:*)', 'Bash(swift:*)',
-    'Bash(git:*)', 'Bash(curl:*)', 'Bash(codegraph:*)',
+    'Bash(codegraph:*)',
     'Bash(ls:*)', 'Bash(cat:*)', 'Bash(find:*)', 'Bash(grep:*)', 'Bash(wc:*)',
-    'Bash(which:*)', 'Bash(echo:*)', 'Bash(mkdir:*)', 'Bash(cd:*)',
-    'Read(*)', 'Edit(*)', 'Write(*)', 'WebFetch(*)', 'WebSearch(*)'
+    'Bash(which:*)', 'Bash(echo:*)', 'Bash(mkdir:*)', 'Bash(cd:*)'
 ]
 
 for perm in recommended:
@@ -409,7 +456,7 @@ for perm in recommended:
         data['permissions']['allow'].append(perm)
         added.append(perm)
 
-with open('$SETTINGS_LOCAL', 'w') as f:
+with open(os.environ['SETTINGS_LOCAL'], 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 
@@ -424,7 +471,7 @@ else:
 fi
 
 # ── AGENTS.md (Codex instructions) ──────────────────────────────────────
-AGENTS_MD="$TARGET/AGENTS.md"
+# AGENTS_MD 已在 Phase 2 顶部用 ci_canon 解析
 if [[ ! -f "$AGENTS_MD" ]]; then
     echo "  [NEW] Creating AGENTS.md (Codex)..."
     cat > "$AGENTS_MD" << 'AGENTS_EOF'
@@ -461,6 +508,7 @@ harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径，�
 
 注：`settings.local.json` 里的 `plansDirectory` 字段是预留配置，当前 harness 版本不读取，仍需通过本规则手动镜像。
 AGENTS_EOF
+    manifest_record "$(basename "$AGENTS_MD")"
     CREATED=$((CREATED + 1))
 else
     echo "  [KEEP] AGENTS.md — preserving existing content"
@@ -471,40 +519,66 @@ else
     fi
 fi
 
-# ── .codex/AGENTS.md ────────────────────────────────────────────────────
-CODEX_AGENTS="$TARGET/.codex/AGENTS.md"
-if [[ ! -f "$CODEX_AGENTS" ]]; then
-    echo "  [NEW] Creating .codex/AGENTS.md..."
-    cat > "$CODEX_AGENTS" << 'CODEX_EOF'
-# Codex Project Instructions
-
-This file is read by Codex when working in this project.
-
-## Project Notes
-
-- Add repo-specific expectations here so Codex follows the same conventions as human contributors.
-- Prefer the project's existing commands and architecture over introducing bespoke workflows.
-
-## Plan 文件镜像
-
-harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径）。退出 plan 模式之前必须把副本镜像到 `.claude/plans/`，步骤：
-
-1. 从 plan mode 的 system message 拿到 plan 的 `file_path`（绝对路径）
-2. `mkdir -p .claude/plans`
-3. `cp <file_path> .claude/plans/$(basename <file_path>)`
-4. 在副本末尾追加 `<!-- mirror source: <file_path> -->`
-5. 完成后再退出 plan 模式
-
-`plansDirectory` 字段当前不生效，必须靠本规则手动镜像。
-CODEX_EOF
-    CREATED=$((CREATED + 1))
+# ── .codex/AGENTS.md (软连接 → ../AGENTS.md) ────────────────────────────────────
+# 新布局：以 .claude/ 为主，.codex/ 内容都是软连接到 .claude/ ，
+# 唯一例外是 .codex/AGENTS.md 与 .claude/CLAUDE.md —— 它们是给对方工具
+# 直接读取的入口文件，symlink 指向项目根的 AGENTS.md / CLAUDE.md。
+CODEX_AGENTS="$TARGET/$CODEX_DIR/AGENTS.md"
+if [[ ! -e "$CODEX_AGENTS" && ! -L "$CODEX_AGENTS" ]]; then
+    if [[ -f "$AGENTS_MD" ]]; then
+        ln -s "../AGENTS.md" "$CODEX_AGENTS"
+        echo "  [NEW] Symlinked $CODEX_DIR/AGENTS.md → ../AGENTS.md"
+        manifest_record "$CODEX_DIR/AGENTS.md"
+        CREATED=$((CREATED + 1))
+    else
+        echo "  [SKIP] $CODEX_DIR/AGENTS.md symlink — project-root AGENTS.md missing"
+    fi
 else
-    echo "  [KEEP] .codex/AGENTS.md — preserving existing content"
+    echo "  [KEEP] $CODEX_DIR/AGENTS.md — preserving existing"
     SKIPPED=$((SKIPPED + 1))
-    # 已存在但缺少 Plan 镜像规则 → 自动追加
-    if pmr_inject "$TARGET" ".codex/AGENTS.md"; then
+fi
+
+# ── .claude/CLAUDE.md 软连接到项目根 CLAUDE.md ────────────────────────────
+CLAUDE_SYMLINK="$TARGET/$CLAUDE_DIR/CLAUDE.md"
+if [[ ! -e "$CLAUDE_SYMLINK" && ! -L "$CLAUDE_SYMLINK" ]]; then
+    if [[ -f "$CLAUDE_MD" ]]; then
+        ln -s "../CLAUDE.md" "$CLAUDE_SYMLINK"
+        echo "  [NEW] Symlinked $CLAUDE_DIR/CLAUDE.md → ../CLAUDE.md"
+        manifest_record "$CLAUDE_DIR/CLAUDE.md"
         CREATED=$((CREATED + 1))
     fi
+else
+    : # 已存在（实文件或 symlink）就不动
+fi
+
+# ── .codex/<sub> 软连接到 ../.claude/<sub>（rules / skills / commands / plans / progress） ──
+# Additive：目标实目录已存在则跳过 symlink；目标不存在则也无 .claude/<sub> 可指。
+for sub in rules skills commands plans progress; do
+    target_link="$TARGET/$CODEX_DIR/$sub"
+    target_real="$TARGET/$CLAUDE_DIR/$sub"
+    if [[ -d "$target_real" ]] && [[ ! -e "$target_link" && ! -L "$target_link" ]]; then
+        ln -s "../$CLAUDE_DIR/$sub" "$target_link"
+        echo "  [NEW] Symlinked $CODEX_DIR/$sub → ../$CLAUDE_DIR/$sub"
+        manifest_record "$CODEX_DIR/$sub"
+        CREATED=$((CREATED + 1))
+    fi
+done
+
+# ── 拷贝 bundled 命令模板到 .claude/commands/（additive：已存在不动） ────────
+if [[ -d "$SKILL_DIR/assets/commands" ]]; then
+    mkdir -p "$TARGET/$CLAUDE_DIR/commands"
+    while IFS= read -r -d '' src_cmd; do
+        cmd_name="$(basename "$src_cmd")"
+        target_cmd="$TARGET/$CLAUDE_DIR/commands/$cmd_name"
+        if [[ ! -e "$target_cmd" ]]; then
+            cp "$src_cmd" "$target_cmd"
+            echo "  [NEW] Installed command: $CLAUDE_DIR/commands/$cmd_name"
+            manifest_record "$CLAUDE_DIR/commands/$cmd_name"
+            CREATED=$((CREATED + 1))
+        else
+            : # 已存在（用户可能已自定义）—— 不覆盖
+        fi
+    done < <(find "$SKILL_DIR/assets/commands" -maxdepth 1 -type f -name '*.md' -print0 2>/dev/null)
 fi
 
 # ── CodeGraph initialization ────────────────────────────────────────────
@@ -517,7 +591,7 @@ else
     echo "      Install: curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh"
 fi
 
-if [[ -d "$TARGET/.codegraph" ]]; then
+if [[ -n "$(ci_resolve .codegraph 2>/dev/null)" ]]; then
     echo "  [KEEP] .codegraph/ — already initialized"
     SKIPPED=$((SKIPPED + 1))
 else
@@ -525,6 +599,7 @@ else
         echo "  [NEW] Running codegraph init..."
         if codegraph init "$TARGET" 2>&1 | sed 's/^/    /'; then
             echo "  ✓ CodeGraph initialized"
+            manifest_record_tree "$CODEGRAPH_DIR"
             CREATED=$((CREATED + 1))
         else
             echo "  ⚠ codegraph init failed (non-fatal)"
@@ -536,9 +611,8 @@ else
 fi
 
 # ── .claude/progress/ (autonomous dev tracking) ─────────────────────────
-PROGRESS_DIR="$TARGET/.claude/progress"
-PROGRESS_README="$PROGRESS_DIR/README.md"
-PROBLEMS_MD="$PROGRESS_DIR/problems.md"
+# PROGRESS_README / PROBLEMS_MD 已在 Phase 2 顶部用 CLAUDE_DIR 解析
+# .codex/AGENTS.md 是软连接到 ../AGENTS.md，规则块已通过 pmr_inject 写到根 AGENTS.md
 
 if [[ ! -f "$PROGRESS_README" ]]; then
     echo "  [NEW] Creating .claude/progress/README.md..."
@@ -599,6 +673,7 @@ if [[ ! -f "$PROGRESS_README" ]]; then
 
 - [ ] 开始 Stage 001
 PROGRESS_README_EOF
+    manifest_record "$CLAUDE_DIR/progress/README.md"
     CREATED=$((CREATED + 1))
 else
     echo "  [KEEP] .claude/progress/README.md — preserving existing content"
@@ -666,15 +741,67 @@ if [[ ! -f "$PROBLEMS_MD" ]]; then
 #### 经验总结
 -->
 PROBLEMS_EOF
+    manifest_record "$CLAUDE_DIR/progress/problems.md"
     CREATED=$((CREATED + 1))
 else
     echo "  [KEEP] .claude/progress/problems.md — preserving existing content"
     SKIPPED=$((SKIPPED + 1))
 fi
 
+# ── .claude/memory/MEMORY.md (项目级长期记忆索引) ─────────────────────────
+# 区别于 .claude/progress/（按 Stage 滚动），本目录存跨会话 / 不再变的长期知识：
+# 设计决策、长期约束、已知坑、本项目特有约定。MEMORY.md 自身每次会话加载到上下文，
+# 单篇事实以独立的 <slug>.md 文件存储，正文用 [[name]] 互链。
+if [[ ! -f "$MEMORY_INDEX" ]]; then
+    echo "  [NEW] Creating $CLAUDE_DIR/memory/MEMORY.md..."
+    cat > "$MEMORY_INDEX" << 'MEMORY_EOF'
+# MEMORY
+
+> 项目级长期记忆索引。每次会话开始时被加载到上下文，正文事实以单独 `<slug>.md` 文件存储。
+>
+> 与 `.claude/progress/` 的区别：progress 按 Stage / Issue 滚动更新，memory 存**跨 Stage 不变**的事实（设计决策、长期约束、已知坑、命名约定）。
+
+## 怎么用
+
+- **新增一条记忆**：在 `.claude/memory/` 目录下新建一个 `<kebab-case-slug>.md`，文件含 YAML frontmatter（`name` / `description` / `type: feedback|reference|project`）。
+- **在本索引登记**：在下方列表里加一行 `- [标题](<slug>.md) — 一句话摘要`。
+- **关联**：在其它 memory 文件里用 `[[<slug>]]` 互相引用。
+- **修改 / 删除**：直接编辑 `.md` 正文；本索引的链接会自动跟随。
+
+## 不要什么
+
+- 不要把**当前任务进度**写到这里 —— 那是 `.claude/progress/` 的职责。
+- 不要把**敏感信息**（密码、API key、token）写到这里。
+
+## 索引
+
+| # | 标题 | 类型 | 摘要 |
+|---|------|------|------|
+| — | — | — | — |
+MEMORY_EOF
+    manifest_record "$CLAUDE_DIR/memory/MEMORY.md"
+    CREATED=$((CREATED + 1))
+else
+    echo "  [KEEP] $CLAUDE_DIR/memory/MEMORY.md — preserving existing"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
 # ── Mark initialization done ────────────────────────────────────────────
-INIT_MARKER="$TARGET/.claude/.init-done"
+# INIT_MARKER 跟随已解析的 CLAUDE_DIR（用户已有 .Claude/ 时也写入 .Claude/.init-done）
+INIT_MARKER="$TARGET/$CLAUDE_DIR/.init-done"
+manifest_record "$CLAUDE_DIR/.init-done"
 date -u +"%Y-%m-%dT%H:%M:%SZ" > "$INIT_MARKER"
+
+# Keep teardown ownership explicit. Only paths created by this run are
+# eligible for automatic removal; user-added files in shared directories stay.
+if [[ ! -f "$MANIFEST" ]]; then
+    printf '%s\n' '# project-init created paths' > "$MANIFEST"
+fi
+for created_path in "${CREATED_PATHS[@]}"; do
+    if ! grep -Fxq "$created_path" "$MANIFEST" 2>/dev/null; then
+        printf '%s\n' "$created_path" >> "$MANIFEST"
+    fi
+done
 
 # ══════════════════════════════════════════════════════════════════════════
 # SUMMARY

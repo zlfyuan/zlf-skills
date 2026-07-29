@@ -40,6 +40,7 @@
 │   ├── progress/                 # 🌀 自主开发状态追踪
 │   │   ├── README.md
 │   │   └── problems.md
+│   ├── .project-init-manifest     # setup 创建清单，供安全 teardown 使用
 │   └── .init-done                # 幂等性标记
 ├── .codex/
 │   └── AGENTS.md
@@ -65,6 +66,7 @@
 - **`settings.local.json` → 智能合并**。只补缺失的推荐权限，已有权限完全保留
 - **已有目录 → 保留不动**。`mkdir -p` 幂等
 - 重跑 `setup-project.sh` 是安全的
+- teardown 只删除创建清单中的文件和软连接，用户新增内容会保留
 
 ### Plan 文件镜像（关键）
 

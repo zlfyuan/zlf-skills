@@ -67,6 +67,7 @@ process_project() {
     local failed=0
 
     for rel in "CLAUDE.md" "AGENTS.md" ".codex/AGENTS.md"; do
+        # pmr_inject 内部已按大小写不敏感解析 rel_path；调用方无需预先转换
         pmr_inject "$project" "$rel"
         case $? in
             0) injected=$((injected + 1)) ;;
@@ -91,15 +92,18 @@ if [[ "$RECURSIVE" == true ]]; then
         exit 2
     fi
     echo "🔍 递归扫描: $SCAN_ROOT (深度 ≤ 4, 排除 node_modules/.git/build/dist)"
+    # 大小写不敏感：兼容 `.claude/` `.Claude/` `.CLAUDE/` 等用户变体
     while IFS= read -r dir; do
-        TARGETS+=("$dir")
-    done < <(find "$SCAN_ROOT" -maxdepth 4 -type d -name ".claude" \
+        # parent dir = strip trailing "/<.claude>" of any case
+        parent="${dir%/*}"
+        TARGETS+=("$parent")
+    done < <(find "$SCAN_ROOT" -maxdepth 4 -type d -iname ".claude" \
                 -not -path "*/node_modules/*" \
                 -not -path "*/.git/*" \
                 -not -path "*/build/*" \
                 -not -path "*/dist/*" \
                 -not -path "*/vendor/*" \
-                2>/dev/null | sed 's|/.claude$||')
+                2>/dev/null)
 fi
 
 TOTAL=${#TARGETS[@]}

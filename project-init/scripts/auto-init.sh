@@ -1,73 +1,71 @@
 #!/usr/bin/env bash
 # Auto-initialization hook entry point.
 # Called by Claude Code / Codex hooks on first interaction in a project.
-# Fast-path: exits immediately if already initialized.
 #
 # Usage: auto-init.sh [directory]
 # Exit codes:
-#   0 - initialized or already done (pass through)
-#   1 - not a code project (agent should warn user)
+#   0 - initialized or already done
+#   1 - not a code project
 #   2 - setup failed
 
-# set -euo pipefail
+set -euo pipefail
 
-# TARGET="${1:-$PWD}"
-# SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TARGET="${1:-$PWD}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# # ── Fast path: already initialized ────────────────────────────────────
-# if [[ -f "$TARGET/.claude/.init-done" ]]; then
-#     exit 0
-# fi
+if [[ ! -d "$TARGET" ]]; then
+    echo "Could not initialize missing directory: $TARGET" >&2
+    exit 2
+fi
 
-# # ── Detect project type ───────────────────────────────────────────────
-# # Capture stdout AND exit code separately (detect script exits 1 for non-code)
-# DETECT_OUTPUT="$("$SCRIPT_DIR/detect-code-project.sh" "$TARGET" 2>/dev/null)" && DETECT_EXIT=0 || DETECT_EXIT=$?
-# DETECT_RESULT="${DETECT_OUTPUT:-DETECT_ERROR}"
+TARGET="$(cd "$TARGET" && pwd)"
 
-# if [[ "$DETECT_RESULT" == "CODE_PROJECT" ]]; then
-#     # ── Code project: run setup ───────────────────────────────────────
-#     "$SCRIPT_DIR/setup-project.sh" "$TARGET"
-#     exit 0
-# elif [[ "$DETECT_RESULT" == "NOT_CODE_PROJECT" ]]; then
-#     # ── Not a code project: create warning marker ─────────────────────
-#     # Create a minimal CLAUDE.md that warns agents
-#     if [[ ! -f "$TARGET/CLAUDE.md" ]]; then
-#         mkdir -p "$TARGET/.claude"
-#         cat > "$TARGET/CLAUDE.md" << 'NONCODE_EOF'
-# # ⚠️ Non-Code Project
+# Resolve the marker case-insensitively so .Claude/.init-done is reused.
+source "$SCRIPT_DIR/ci-path.sh"
+if [[ -n "$(ci_resolve ".claude/.init-done" 2>/dev/null || true)" ]]; then
+    exit 0
+fi
 
-# This directory does not appear to be a programming/code project.
+if DETECT_OUTPUT="$($SCRIPT_DIR/detect-code-project.sh "$TARGET" 2>/dev/null)"; then
+    DETECT_EXIT=0
+else
+    DETECT_EXIT=$?
+fi
 
-# If you are trying to work with code, please switch to a directory that contains source files (e.g., `.swift`, `.ts`, `.py`, `.go`, `.js`, etc.) or has a package manager file (e.g., `package.json`, `Podfile`, `Cargo.toml`, etc.).
+case "$DETECT_OUTPUT" in
+    CODE_PROJECT)
+        if "$SCRIPT_DIR/setup-project.sh" "$TARGET"; then
+            exit 0
+        fi
+        exit 2
+        ;;
+    NOT_CODE_PROJECT)
+        # Keep the warning additive and do not overwrite user instruction files.
+        CLAUDE_MD="$TARGET/CLAUDE.md"
+        AGENTS_MD="$TARGET/AGENTS.md"
+        if [[ ! -e "$CLAUDE_MD" && ! -L "$CLAUDE_MD" ]]; then
+            cat > "$CLAUDE_MD" <<'NONCODE_EOF'
+# Non-Code Project
 
-# ## What to do:
-# 1. `cd` into your actual code project directory
-# 2. Restart your agent
-# 3. The project will be auto-initialized on first use
+This directory does not appear to be a programming project.
 
-# If you believe this IS a code project, create an empty `.claude/.init-done` file to skip this check:
-# ```bash
-# mkdir -p .claude && touch .claude/.init-done
-# ```
-# NONCODE_EOF
-#     fi
+Switch to the code project directory before using coding agents.
+NONCODE_EOF
+        fi
+        if [[ ! -e "$AGENTS_MD" && ! -L "$AGENTS_MD" ]]; then
+            cat > "$AGENTS_MD" <<'NONCODEX_EOF'
+# Non-Code Project
 
-#     if [[ ! -f "$TARGET/AGENTS.md" ]]; then
-#         mkdir -p "$TARGET/.codex"
-#         cat > "$TARGET/AGENTS.md" << 'NONCODEX_EOF'
-# # ⚠️ Non-Code Project
+This directory does not appear to be a programming project.
 
-# This directory does not appear to be a programming/code project.
-
-# Please switch to a code project directory before using coding agents.
-# NONCODEX_EOF
-#     fi
-
-#     # Emit a JSON result that hooks can parse
-#     echo '{"status":"not_code_project","message":"This directory does not appear to be a programming project. Please switch to a code project directory."}'
-#     exit 1
-# else
-#     # Detection error — pass through to avoid blocking legitimate work
-#     echo "⚠️  Could not determine project type. Pass through." >&2
-#     exit 0
-# fi
+Switch to the code project directory before using coding agents.
+NONCODEX_EOF
+        fi
+        echo '{"status":"not_code_project","message":"This directory does not appear to be a programming project. Please switch to a code project directory."}'
+        exit 1
+        ;;
+    *)
+        echo "Could not determine project type (exit $DETECT_EXIT); passing through." >&2
+        exit 0
+        ;;
+esac

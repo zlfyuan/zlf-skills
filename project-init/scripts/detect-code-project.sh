@@ -97,15 +97,31 @@ SOURCE_EXTS=(
     "sh" "bash" "zsh"             # Shell
     "vue" "svelte" "astro"        # Frontend frameworks
     "tf" "tfvars"                  # Terraform
-    "yaml" "yml"                   # Config / K8s
-    "toml"                         # Config
-    "proto"                        # Protobuf
-    "graphql" "gql"               # GraphQL
 )
 
 # Count source files (sampled, max 5000 files for performance)
 SOURCE_COUNT=0
 TOTAL_COUNT=0
+# Pre-collect case-insensitive matches for agent dirs so we exclude `.Claude/` 等用户变体。
+# 这些目录在大小写敏感 FS 上可能是任意大小写组合。不用 mapfile（macOS /bin/bash 3.2 不支持）。
+AGENT_EXCLUDE_ARGS=()
+while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    AGENT_EXCLUDE_ARGS+=( -not -path "$d" -not -path "$d/*" )
+done < <(find "$TARGET" -type d \( -iname '.claude' -o -iname '.codex' -o -iname '.codegraph' \) 2>/dev/null)
+# Build the find arguments separately. Bash 3.2 with `set -u` errors when an
+# empty array is expanded inline, which is the normal case for a fresh project.
+FIND_ARGS=(
+    "$TARGET" -type f
+    -not -path '*/.git/*' -not -path '*/node_modules/*'
+    -not -path '*/Pods/*' -not -path '*/vendor/*' -not -path '*/.build/*'
+    -not -path '*/target/*' -not -path '*/dist/*' -not -path '*/build/*'
+    -not -path '*/__pycache__/*' -not -path '*.pyc'
+)
+if [[ ${#AGENT_EXCLUDE_ARGS[@]} -gt 0 ]]; then
+    FIND_ARGS+=("${AGENT_EXCLUDE_ARGS[@]}")
+fi
+
 while IFS= read -r -d '' file; do
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     ext="${file##*.}"
@@ -119,12 +135,7 @@ while IFS= read -r -d '' file; do
     if [[ $TOTAL_COUNT -ge 5000 ]]; then
         break
     fi
-done < <(find "$TARGET" -type f -not -path '*/.git/*' -not -path '*/node_modules/*' \
-    -not -path '*/Pods/*' -not -path '*/vendor/*' -not -path '*/.build/*' \
-    -not -path '*/target/*' -not -path '*/dist/*' -not -path '*/build/*' \
-    -not -path '*/__pycache__/*' -not -path '*.pyc' \
-    -not -path '*/.codegraph/*' -not -path '*/.claude/*' -not -path '*/.codex/*' \
-    -print0 2>/dev/null || true)
+done < <(find "${FIND_ARGS[@]}" -print0 2>/dev/null || true)
 
 # If at least 5 source files found, or source ratio > 5%, it's a code project
 if [[ $SOURCE_COUNT -ge 5 ]]; then

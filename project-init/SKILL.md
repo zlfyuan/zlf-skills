@@ -2,9 +2,10 @@
 name: project-init
 description: >
   自动检测并初始化编程项目，管理自主开发循环。
-  每次启动 Claude Code 或 Codex 时触发 —— 检查当前目录是否是编程项目，
-  如果是则自动创建 .claude/ 和 .codex/ 目录结构、初始化 CLAUDE.md / AGENTS.md、
-  .claude/progress/ 状态追踪目录、配置默认权限、添加 CodeGraph MCP 并执行 codegraph init。
+  每次启动 Claude Code 或 Codex 时触发 —— 检测当前目录是否是编程项目，
+  如果是则自动创建 .claude/ 和 .codex/ 目录结构（.codex/ 全部软连接到 .claude/）、
+  初始化 CLAUDE.md / AGENTS.md、.claude/progress/ 状态追踪目录、配置默认权限、
+  安装 /z-commit /z-push /z-commit-push 等斜杠命令模板、添加 CodeGraph MCP 并执行 codegraph init。
   当用户使用 /loop 或 /goal 命令启动自主开发循环时，触发并强制执行自主开发规则：
   维护 .claude/progress/ 状态追踪（README.md 总索引 + stage-NNN.md 阶段文件 + problems.md 踩坑记录）、
   每个模块编译验证后才能推进、最终用户视角完整测试、
@@ -13,42 +14,307 @@ description: >
   "autonomous development"、"自主开发" 等关键词。
   IMPORTANT: 当用户在非代码目录中向 Claude 提问代码问题时，使用此技能检查项目类型并给出适当提示。
   IMPORTANT: 当用户使用 /loop 或 /goal 启动自主开发任务时，使用此技能强制执行开发循环规则和 PROGRESS.md 状态追踪。
+license: MIT
 ---
 
 # Project Init — 项目自动初始化
 
-## 概述
-
-这个技能负责在 Claude Code 或 Codex 中自动检测和初始化代码项目。它确保每个编程项目都有正确的基础设施：代理指令文件、权限配置、CodeGraph 代码图索引，以及自主开发循环所需的 `.claude/progress/` 状态追踪目录。
-
-当用户使用 `/loop` 或 `/goal` 命令启动自主开发任务时，此技能强制执行开发规则，确保 Agent 自主推进、不频繁停下来等待确认。进度数据存储在 `.claude/progress/` 目录中，项目根目录保持整洁。
+为每个编程项目建立统一的基础设施：项目指令文件、权限配置、CodeGraph 代码图索引、自主开发追踪，以及一组 git 快捷命令。在 **Claude Code** 和 **Codex** 中行为一致，`.codex/` 下全部内容是软连接到 `.claude/`（除 `AGENTS.md` 入口文件）。
 
 ---
 
-## 🌀 自主开发循环规则
+## 目录
 
-当 `/loop` 或 `/goal` 被触发时，**必须严格遵守以下 4 条规则**，全程自主推进，除非遇到无法自行解决的阻塞问题。
+- [概览](#概览)
+- [何时触发](#何时触发)
+- [创建的项目结构](#创建的项目结构)
+- [执行流程](#执行流程)
+- [Bundled 斜杠命令](#bundled-斜杠命令)
+- [关键子系统](#关键子系统)
+- [自主开发循环（/loop、/goal）](#自主开发循环loopgoal)
+- [脚本参考](#脚本参考)
+- [检测「编程项目」的标准](#检测编程项目的标准)
+- [卸载 / 回滚（teardown）](#卸载--回滚teardown)
+- [Additive-Only 原则](#additive-only-原则)
+- [安装位置与依赖](#安装位置与依赖)
 
-### 规则 1：状态追踪 → .claude/progress/
+---
 
-进度追踪文件全部放在 `.claude/progress/` 目录下，结构如下：
+## 概览
 
+`project-init` 把"项目状态 + 代理指令文件 + 开发工具链"打包成一个一键动作：
+
+| 维度 | 之前 | 之后 |
+|------|------|------|
+| 项目指令 | 无 / 各家工具各自找 | 根目录 `CLAUDE.md` + `AGENTS.md` + `.claude/CLAUDE.md`、`.codex/AGENTS.md` 软连接 |
+| 权限 | 全部默认 deny | `.claude/settings.local.json` 带 npm / go / cargo / git / codegraph 等常用白名单 |
+| CodeGraph | 需要手动 `codegraph init` | 自动检测 CLI 并执行 `codegraph init` |
+| Plan 存档 | 写到 `~/.claude/plans/`（项目外，git 看不到） | Plan 镜像规则注入到所有指令文件，强制 cp 到 `.claude/plans/` |
+| Git 快捷方式 | `/commit`、`/push` 等无统一约定 | `/z-commit`、`/z-push`、`/z-commit-push` 三条自动化斜杠命令 |
+| 自主开发 | 自由发挥 | `.claude/progress/` 强制维护 `README.md` + `stage-NNN.md` + `problems.md` |
+
+**核心原则**：只增不删、只补不改。对用户已有内容一律保留。
+
+---
+
+## 何时触发
+
+### 自动触发（Claude Code / Codex SessionStart hook）
+
+每次新会话开始时，`auto-init.sh` 检查 `.claude/.init-done`：
+
+- 存在 → 已初始化，跳过
+- 不存在 → `detect-code-project.sh` 判断 → 是编程项目就跑 `setup-project.sh`
+
+### 手动触发关键词
+
+不论 Claude Code 还是 Codex，会话里输入下列任意一条即可触发：
+
+| 中文 | 英文 |
+|------|------|
+| 初始化项目 / 项目初始化 | `init project` |
+| 配置项目 | `setup project` |
+| 自主开发 | `autonomous development` |
+
+执行链路：
+
+1. `bash scripts/detect-code-project.sh <dir>` —— 判断是否是编程项目
+2. 是 → `bash scripts/setup-project.sh <dir>` —— 增量初始化
+3. 否 → 提示用户切换到正确的代码项目目录（不阻塞工作）
+
+---
+
+## 创建的项目结构
+
+初始化（**可重入，additive-only**）后会得到如下布局：
+
+```text
+project-root/
+├── CLAUDE.md                 # Claude Code 项目指令（由 `claude /init` 代码库感知生成）
+├── AGENTS.md                 # Codex / 其他代理 项目指令
+├── .claude/                  # 主目录 —— 全部实文件，承担 config + 状态存储
+│   ├── CLAUDE.md             # symlink → ../CLAUDE.md
+│   ├── settings.local.json   # 项目级权限配置 + plansDirectory
+│   ├── rules/                # 项目规则目录
+│   ├── skills/               # 项目级技能目录
+│   ├── commands/             # 自定义命令目录（含 /z-commit /z-push /z-commit-push 模板）
+│   ├── plans/                # Plan 模式计划存档（由镜像规则强制填充）
+│   ├── progress/             # 🌀 自主开发状态追踪
+│   │   ├── README.md         #   总索引（Stage 列表 + 进度统计 + 问题速览）
+│   │   ├── stage-NNN.md      #   每个阶段的 目标 / 子任务 / 执行日志
+│   │   └── problems.md       #   踩坑知识库（出现次数 / 最终方案）
+│   ├── memory/               # 项目级长期记忆（跨会话加载的事实/约定/已知坑）
+│   │   └── MEMORY.md         #   索引：每条记忆一行摘要，正文以独立 <slug>.md 存放
+│   ├── .project-init-manifest # setup 创建清单，供 teardown 精确清理
+│   └── .init-done            # 一次性初始化完成标记
+├── .codex/                   # 镜像目录 —— 除 AGENTS.md 外其余都软连接到 .claude/
+│   ├── AGENTS.md             # symlink → ../AGENTS.md
+│   ├── rules/                # symlink → ../.claude/rules
+│   ├── skills/               # symlink → ../.claude/skills
+│   ├── commands/             # symlink → ../.claude/commands
+│   ├── plans/                # symlink → ../.claude/plans
+│   └── progress/             # symlink → ../.claude/progress
+└── .codegraph/               # CodeGraph 索引数据（由 codegraph init 自动生成）
 ```
+
+### 布局哲学
+
+以 `.claude/` 为唯一**真实**存储（实文件 = 全部 config 和状态），`.codex/` 通过软连接复用 —— 两边工具读到的总是同一份内容，杜绝"两份实例的不一致"。
+
+**唯一例外**：`.codex/AGENTS.md` 和 `.claude/CLAUDE.md` 是对方工具在自己目录下寻找入口文件的"门面"，它们通过软连接指向项目根的 `AGENTS.md` / `CLAUDE.md`。
+
+**Additive 安全**：用户已有 `.codex/<sub>` 实目录 / 实文件时不会被替换为软连接；只在该子项不存在时才建软连接。
+
+---
+
+## 执行流程
+
+`auto-init.sh` 是入口；真实的判定 + 初始化调用图：
+
+```text
+┌─────────────────────────────┐
+│  检查 .claude/.init-done    │
+│  ├─ 存在 → 已完成，跳过     │
+│  └─ 不存在 → 继续判定       │
+└─────────────┬───────────────┘
+              ▼
+┌─────────────────────────────┐
+│  detect-code-project.sh     │
+│  编程项目判定               │
+│  ├─ 包管理标记 (优先级最高) │
+│  ├─ 源代码文件 ≥ 5 个       │
+│  └─ .git 历史含代码         │
+└─────────────┬───────────────┘
+              ▼
+   ┌──────────┴──────────┐
+   ▼                     ▼
+┌──────────┐      ┌──────────────┐
+│ 是代码   │      │ 非代码项目   │
+│ 项目     │      │ 写告警到     │
+│          │      │ CLAUDE.md /  │
+│ setup.sh │      │ AGENTS.md    │
+└──────────┘      └──────────────┘
+```
+
+`setup-project.sh` 内部又分两阶段：
+
+1. **Phase 1 · Audit** —— 用 `ci_resolve`（大小写不敏感）扫描目标项目，对每一项输出 `[NEW] / [KEEP] / [SKIP]`，**不写盘**
+2. **Phase 2 · Create** —— **只**为 Phase 1 标 `[NEW]` 的项创建文件 / 软连接 / 配置文件
+
+可重入：再次运行看到全 `[KEEP]` 立即退出，零副作用。
+
+---
+
+## Bundled 斜杠命令
+
+`project-init` 在 setup 时把以下三条 git 快捷命令模板从 `assets/commands/` 拷贝到目标项目的 `.claude/commands/`：
+
+| 命令 | 行为 |
+|------|------|
+| `/z-commit` | `git add -A` + 自动生成中文 commit message（基于 `git diff --stat`） → 回车确认 → `git commit`。**不** push。 |
+| `/z-push` | `git push`（无上游自动 `--set-upstream`，**绝不** `--force`）。本地有未提交改动会先拦截。 |
+| `/z-commit-push` | commit + push 合一步：先扫状态，若已有未推送 commit 则跳过 commit 单走 push；否则合并 preview 一次性确认。 |
+
+**触发规则**（在每个命令的 `.md` 里有完整步骤）：
+
+- `/z-commit`：agent 看 `git diff --stat` → 写 Conventional Commits 中文 message → 显示预览 → `read -r -p` 让用户回车 → `git add -A && git commit`
+- `/z-push`：agent 看 `git status`、`git rev-parse --abbrev-ref HEAD`、`git config --get-regexp '^branch\.'` → 显示 preview → 确认 → `git push`
+- `/z-commit-push`：上述两条合一起，统一一次确认
+
+覆盖保护：setup-project.sh 只在目标命令文件**不存在**时才拷贝；用户定制过的同名命令不会被覆盖。
+
+---
+
+## 关键子系统
+
+### 1. CLAUDE.md 生成 —— 调用 `claude /init`
+
+**`CLAUDE.md` 不由 project-init 自己写模板**，而是调用 Claude Code 内置的 `/init` 走代码库感知生成；project-init 在末尾追加 Plan 镜像规则。
+
+调用方式（`setup-project.sh` 中自动执行，180s 超时）：
+
+```bash
+cd "$TARGET" && \
+claude --bare --permission-mode acceptEdits \
+  --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*),Bash(head:*)" \
+  -p "/init" < /dev/null
+```
+
+| flag | 为何必须 |
+|------|---------|
+| `--bare` | 否则 subprocess 触发 `SessionStart` hook，钩子链里就是 `auto-init.sh → setup.sh`，会先写占位 `CLAUDE.md` 让 `/init` 的 `Write` 被拒 |
+| `--permission-mode acceptEdits` | 允许 `/init` 写入生成的 `CLAUDE.md`，但不绕过其它工具的权限检查 |
+| `< /dev/null` | 后台 + 重定向时 stdin 不是 TTY，claude 报 "no stdin data received in 3s" 退出 0 不写文件 |
+| `--allowedTools "Write,..."` | 显式列工具子集，避免依赖默认 allowlist |
+
+**回退策略**：`claude` 未装 / `/init` 退出非零 / 超时 / 产物 < 500 字节 → 写带明显占位说明的 heredoc，文件里提示用户手动跑覆盖。
+
+```bash
+# 手动重跑
+claude --bare --permission-mode acceptEdits \
+  --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*)" \
+  -p "/init" < /dev/null
+bash scripts/setup-project.sh "$TARGET"   # 让 Plan 镜像规则被补上
+```
+
+### 2. Plan 文件镜像规则 —— 自动注入到所有指令文件
+
+harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**项目外**，git 追踪不到）。即使 `settings.local.json` 配了 `plansDirectory`，当前 Claude Code 版本**不读取**该字段（已实测）。
+
+因此 setup-project.sh 会在 `CLAUDE.md`、`AGENTS.md` 自动注入 Plan 镜像规则，告诉 agent：
+
+1. 从 plan mode 的 system message 拿 plan 的 `file_path`（绝对路径）
+2. `mkdir -p .claude/plans`
+3. `cp <file_path> .claude/plans/$(basename <file_path>)`
+4. 在副本末尾追加 `<!-- mirror source: <file_path> -->`
+5. 完成上述 4 步**之后**再 `ExitPlanMode`
+
+| 场景 | 行为 |
+|------|------|
+| 文件不存在 | `[NEW]` 创建并嵌入完整 Plan 镜像规则 |
+| 文件已含 Plan 镜像规则 | `[KEEP]` 原样保留 |
+| 文件存在但缺规则 | `[KEEP]` 主体 + 追加规则（如 `/init` 创建的 `CLAUDE.md`） |
+
+**已有项目批量迁移**：
+
+```bash
+bash scripts/inject-plan-mirror.sh /path/to/project   # 单项目
+bash scripts/inject-plan-mirror.sh --dry-run /path/to/project   # 仅预览
+bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有含 .claude/ 的子项目
+```
+
+`pmr_inject` 函数 + 规则块文本在共享 lib `scripts/plan-mirror-rules.sh`，setup / inject 共用同一份逻辑。
+
+### 3. 默认 `.claude/settings.local.json` 权限
+
+合并式创建，缺什么加什么，**不覆盖**已有权限：
+
+- **包管理器**：`Bash(npm:*)` / `Bash(yarn:*)` / `Bash(pnpm:*)` / `Bash(bun:*)` / `Bash(pip:*)` / `Bash(pip3:*)`
+- **运行时**：`Bash(node:*)` / `Bash(python:*)` / `Bash(go:*)` / `Bash(cargo:*)` / `Bash(javac:*)` / `Bash(swift:*)`
+- **构建**：`Bash(xcodebuild:*)` / `Bash(make:*)` / `Bash(cmake:*)` / `Bash(mvn:*)` / `Bash(gradle:*)`
+- **VCS / 网络**：不自动放行 `git`、`curl` 或 Web 工具，首次使用时由用户确认
+- **CodeGraph**：`Bash(codegraph:*)`
+- **shell helpers**：`Bash(ls:*)` / `Bash(cat:*)` / `Bash(find:*)` / `Bash(grep:*)` / `Bash(mkdir:*)` 等
+- **文件 / 网络**：不自动放行全局文件读写和网络访问，避免意外泄露敏感内容
+- **预留**：`plansDirectory = .claude/plans`（forward-compat，等未来 harness 支持时自动生效）
+
+### 4. CodeGraph 集成
+
+| 状态 | 行为 |
+|------|------|
+| `codegraph` CLI 已安装 | 自动 `codegraph init "$TARGET"` 创建 `.codegraph/` 索引 |
+| 未安装 | 给出 `curl -fsSL ... install.sh | sh` 提示，其它初始化照常进行 |
+
+### 5. 项目级长期记忆 —— `.claude/memory/`
+
+每次 setup 会创建 `.claude/memory/MEMORY.md`（additive：已有则不动）。**MEMORY.md 每次会话开始时加载到上下文**，是 agent 跨 Stage 滚动时仍需复用的"长期事实"。
+
+**与 `.claude/progress/` 的关系**：
+
+| `.claude/progress/` | `.claude/memory/` |
+|---------------------|---------------------|
+| 按 Stage / Issue 滚动更新 | 跨 Stage **不变**的事实 |
+| 一次性笔记：当下任务进度 | 设计决策、长期约束、命名约定、已知坑 |
+| 一完成 Stage 就归档 / 清理 | 一直累积，越用越值钱 |
+
+**怎么写新条目**：
+
+1. 在 `.claude/memory/<kebab-case-slug>.md` 新建文件，frontmatter 含 `name` / `description` / `type: feedback|reference|project`
+2. 在 `MEMORY.md` 的索引表加一行 `- [标题](<slug>.md) — 一句话摘要`
+3. 文件之间互相 `[[<slug>]]` 引用
+
+**禁写**：
+
+- 当前任务进度（属于 progress）
+- 敏感信息：密码 / API key / token
+- 临时性的 chat 内容
+
+### 6. 大小写不敏感路径解析（fix）
+
+`scripts/ci-path.sh` 共享 lib 提供 `ci_topdir` / `ci_resolve` / `ci_exists` / `ci_canon`，POSIX-sh 兼容（bash / zsh 均可 source）。setup / teardown / inject / detect 都通过它处理 `.Codex/` `.CLAUDE/` 等用户手建变体：
+
+- 文档统一小写（`.claude/` `.codex/`）
+- 实际检查大小写不敏感（命中后保留用户原大小写）
+- 已有 case-variant 时复用而非创建平行 `.claude/` / `.codex/` 副本
+
+---
+
+## 自主开发循环（/loop、/goal）
+
+当 `/loop` 或 `/goal` 被触发，**必须严格遵守**以下 4 条规则，全程自主推进，除非遇到无法自行解决的阻塞问题。
+
+### 规则 1 · 状态追踪 → `.claude/progress/`
+
+```text
 .claude/progress/
-├── README.md          # 总索引：当前阶段、Stage 列表、进度统计、问题速览
-├── stage-001.md       # 阶段文件：每个 Stage 的目标、子任务、执行日志
-├── stage-002.md       # （第二个 Stage 时创建）
-├── ...
-└── problems.md        # 踩坑记录：反复遇到的问题、尝试方案、最终解决方式
+├── README.md     # 总索引：当前阶段、Stage 列表、进度统计、问题速览
+├── stage-001.md  # 阶段文件：🎯 目标 / 📋 子任务 / 📝 执行日志 / 🚧 问题 / ✅ 验证
+├── stage-002.md
+└── problems.md   # 踩坑记录：问题索引 + 每个问题的症状 / 尝试 / 最终方案
 ```
 
-**README.md** — 总仪表盘，自动维护：
-- 当前阶段和总体进度
-- Stage 列表（编号、名称、状态、备注）
-- 进度统计（已完成 / 进行中 / 已跳过）
-- 当前未解决问题的速览表
+**stage-NNN.md 模板**：
 
-**stage-NNN.md** — 每个阶段的详细记录：
 ```markdown
 # Stage 001: 任务名称
 - 状态: 🔄 进行中 | 开始: YYYY-MM-DD | 尝试: 0/5
@@ -60,349 +326,144 @@ description: >
 ## ✅ 验证记录
 ```
 
-**problems.md** — 踩坑知识库：
-- 问题索引表（编号、简述、涉及 Stage、出现次数、状态）
-- 每个问题的详情：症状、尝试方案、最终方案、经验总结
-- 同一个问题重复出现时**更新出现次数**，不新建条目
+**更新时机**：每完成一个 Stage → 更新 README.md 统计 + 推对应 stage-NNN.md 状态。**不要攒到最后补**。
 
-**更新时机**：每完成一个 Stage 就更新 README.md 中的统计和 Stage 状态，同时在对应的 stage-NNN.md 中追加执行日志。不要攒到最后一次性补。
+### 规则 2 · 开发-验证闭环
 
-### 规则 2：开发-验证闭环
-
-```
+```text
 ┌──────────┐    编译/运行      ┌──────────┐
 │ 完成模块 │ ──────────────→  │ 验证通过? │
 └──────────┘                  └─────┬────┘
-                             ├─ 是 → 更新 PROGRESS.md，推进下一模块
+                             ├─ 是 → 更新 PROGRESS，推进下一模块
                              └─ 否 → 修复错误，重新验证
 ```
 
-- **每完成一个功能模块**，立即编译运行，用实际运行结果验证
-- **有报错就修**，修完再验证，通过后才推进下一个模块
-- **不要攒到最后一起测** —— 问题越早发现越容易定位
-- 每完成一个 Stage，在对应的 stage-NNN.md 中打 ✅ 并更新 README.md 统计
-- 对于无需编译的项目（如纯脚本），用实际调用或单元测试来验证
+- 每完成一个功能模块立即编译运行验证
+- 有报错就修，修完再验证，通过才推进下一个
+- 纯脚本项目用调用 / 单测验证
+- 每通过一个 Stage 在对应 `stage-NNN.md` 打 ✅ 并更新 README 统计
 
-### 规则 3：最终用户视角验证
+### 规则 3 · 最终用户视角验证
 
-全部功能开发完成后，**以用户视角**做一次完整的端到端测试：
+全部模块完成后做一次端到端：
 
-- 用户会怎么使用这个功能？按用户的典型操作流程走一遍
-- 边界情况：空输入、极端值、并发操作、网络断开等
-- 如果有 UI，检查交互流程是否顺畅、错误提示是否清晰
-- 将测试结果记录到对应 stage-NNN.md 的「验证记录」区块，更新 README.md 状态为 ✅
+- 用户典型操作流程走一遍
+- 边界情况：空输入、极值、并发、网络断开
+- UI：错误提示是否清晰、交互是否顺畅
+- 结果写到对应 `stage-NNN.md` 的「验证记录」
 
-### 规则 4：防死循环 — 5 次上限
+### 规则 4 · 防死循环 — 5 次上限
 
-同一个问题修复超过 **5 次**仍未解决，**立即停止**：
+同一问题修复 **>5 次** 仍未解决，**立即停止**并：
 
-1. 在 `problems.md` 中记录详细情况（症状 + 所有尝试），标记为 `🔴 已跳过`
-2. 在当前 stage-NNN.md 中记录跳过决策，在 README.md 中标记该 Stage 为 `🔴 已跳过`
-3. **继续推进其他任务** —— 不要让一个卡点阻塞全部进度
-4. 在最终总结时列出所有被跳过的问题（problems.md 中有完整索引）
+1. 写进 `problems.md`，标 `🔴 已跳过`
+2. 当前 `stage-NNN.md` 记跳过决策，README 标 `🔴 已跳过`
+3. **继续推进其他任务** —— 不要被一个卡点阻塞全部
+4. 最终总结里列出所有被跳过的
 
-**什么算「同一个问题」**：相同的错误信息、相同的症状表现，即使用不同的方法尝试也算同一个问题。如果症状变了（不同的错误），那是新问题，重新计数。
+**同问题的判定**：相同错误信息 / 相同症状。换了方法仍是同症状 → 算同问题；症状变了（不同错误）→ 算新问题，重置计数。
 
 ---
 
-## 工作流程
-
-### 自动化流程（通过 Hook 触发）
-
-每次会话开始时，`auto-init.sh` 会运行以下检测流程：
-
-```
-┌─────────────────────────────┐
-│  检查 .claude/.init-done   │
-│  ├─ 存在 → 已完成，跳过     │
-│  └─ 不存在 → 继续检测       │
-└─────────────┬───────────────┘
-              ▼
-┌─────────────────────────────┐
-│  detect-code-project.sh    │
-│  检测是否是编程项目          │
-│  ├─ 包管理文件 (package.json│
-│  │  Podfile, Cargo.toml...) │
-│  ├─ 源代码文件 (>= 5个)     │
-│  └─ .git 含代码历史         │
-└─────────────┬───────────────┘
-              ▼
-    ┌─────────┴─────────┐
-    │                   │
-    ▼                   ▼
-┌──────────┐    ┌──────────────┐
-│ 是代码项目│    │ 非代码项目    │
-└─────┬────┘    └──────┬───────┘
-      │                │
-      ▼                ▼
-┌──────────────┐  ┌────────────────┐
-│ setup-project│  │ 创建警告文件    │
-│ .sh 初始化   │  │ CLAUDE.md      │
-│              │  │ AGENTS.md      │
-│ • .claude/  │  │ 提示用户切换    │
-│ • .codex/   │  │ 到代码项目目录  │
-│ • codegraph │  └────────────────┘
-│ • settings  │
-└──────────────┘
-```
-
-### 手动触发
-
-用户可以通过以下关键词手动触发：
-
-- `init project` / `setup project` / `initialize project`
-- `初始化项目` / `项目初始化`
-- `setup this project` / `configure project`
-
-手动触发时，技能会：
-1. 运行 `scripts/detect-code-project.sh` 检测项目类型
-2. 如果检测为编程项目，运行 `scripts/setup-project.sh` 初始化
-3. 如果检测为非编程项目，告知用户并询问是否确认继续
-
-## 初始化内容
-
-### 目录结构
-
-初始化后会创建以下结构：
-
-```
-project-root/
-├── CLAUDE.md                 # Claude Code 项目指令（由 `claude /init` 生成，见下）
-├── AGENTS.md                 # Codex / 其他代理 项目指令
-├── .claude/
-│   ├── settings.local.json   # 项目级权限配置 + plansDirectory（预留字段，当前不生效）
-│   ├── rules/                # 项目规则目录
-│   ├── skills/               # 项目级技能目录
-│   ├── commands/             # 自定义命令目录
-│   ├── plans/                # Plan 模式计划存档（由镜像规则填充）
-│   ├── progress/             # 🌀 自主开发状态追踪
-│   │   ├── README.md         #   总索引（Stage 列表 + 进度统计）
-│   │   ├── stage-001.md      #   阶段文件（目标/子任务/执行日志）
-│   │   └── problems.md       #   踩坑记录（问题索引 + 详情）
-│   └── .init-done            # 初始化完成标记
-├── .codex/
-│   └── AGENTS.md             # Codex 目录级指令
-└── .codegraph/               # CodeGraph 索引数据 (由 codegraph init 创建)
-```
-
-### 🧠 CLAUDE.md 生成：调用 `claude /init`
-
-`CLAUDE.md` **不是** project-init 自己写的占位模板，而是由 `claude /init`
-（Claude Code 内置的「分析当前代码库并生成 CLAUDE.md」斜杠命令）生成的代码库感知内容，
-最后再由 project-init 把 Plan 镜像规则追加到末尾。
-
-**调用方式**（`setup-project.sh` 在 CLAUDE.md 不存在时自动执行）：
-
-```bash
-cd "$TARGET" && \
-claude --bare --dangerously-skip-permissions \
-  --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*),Bash(head:*)" \
-  -p "/init" < /dev/null
-```
-
-**每个 flag 为什么必须：**
-
-- **`--bare`** — 不加的话，subprocess 会触发用户的 `SessionStart` hook，
-  而 hook 链上就是 `auto-init.sh → setup-project.sh`，会先把占位 CLAUDE.md 写好，
-  导致 `/init` 申请 `Write` 时被拒。`--bare` 跳过 hooks（以及 CLAUDE.md auto-discovery
-  等副作用），让 `/init` 在干净环境里跑。
-- **`--dangerously-skip-permissions`** — `-p` 模式下 Write / Edit / Bash 默认需要
-  permission prompt（无 TTY 时直接失败），加上这个 flag 才会让 `/init` 真正能落盘。
-  这是 `-p` 模式推荐的标准做法（`claude --help` 明确推荐 sandbox 内用）。
-- **`< /dev/null`** — 后台 + 输出重定向时 stdin 不是 TTY，claude 会报
-  "Warning: no stdin data received in 3s" 然后退出 0 不写文件。显式喂空 stdin 解决。
-- **`--allowedTools "Write,..."`** — 显式列出 /init 需要的工具子集，避免依赖默认 allowlist。
-
-**超时：** 180s（`/init` 对小项目 < 30s，大仓库很少超过 2 分钟）。
-
-**回退策略：** 如果 `claude` CLI 没装、`/init` 退出非零、超时、
-或产物太小 / 仍含占位文本，则回退到带明显占位说明的 heredoc，
-并在文件里告诉用户如何手动重跑 `claude /init` 覆盖。
-
-**手动重跑覆盖（任何时候）：**
-
-```bash
-claude --bare --dangerously-skip-permissions \
-  --allowedTools "Write,Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(wc:*)" \
-  -p "/init" < /dev/null
-# 然后再跑一次 setup-project.sh 让 Plan 镜像规则被补上：
-bash scripts/setup-project.sh "$TARGET"
-```
-
-### 📋 Plan 文件镜像规则（自动注入）
-
-harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**不在项目内**，git 无法追踪）。即使项目级 `settings.local.json` 配置了 `plansDirectory`，**当前 Claude Code 版本不读取该字段**（已实测：cc-switch 项目的 `.claude/plans/` 为空，而 `~/.claude/plans/` 有 13 个文件）。
-
-因此 setup-project.sh 会在 `CLAUDE.md`、`AGENTS.md`、`.codex/AGENTS.md` 三个文件末尾**自动注入 Plan 镜像规则**，告诉 Agent：
-
-1. 从 plan mode system message 拿到 plan 的 `file_path`（绝对路径）
-2. `mkdir -p .claude/plans`
-3. `cp <file_path> .claude/plans/$(basename <file_path>)`
-4. 在副本末尾追加 `<!-- mirror source: <file_path> -->`
-5. **完成上述 4 步之后再调用 ExitPlanMode**
-
-**何时自动注入：**
-
-| 场景 | 行为 |
-|------|------|
-| 文件不存在 | `[NEW]` 创建并嵌入完整 Plan 镜像规则 |
-| 文件已包含 Plan 镜像规则 | `[KEEP]` 原样保留 |
-| 文件存在但**缺少** Plan 镜像规则 | `[KEEP]` 主体内容 + 追加镜像规则（如 `/init` 创建的 CLAUDE.md） |
-
-`settings.local.json` 里的 `plansDirectory` 字段保留，作为 forward-compat 字段，等未来 harness 支持时自动生效。
-
-### 已有项目迁移（手动工具）
-
-`setup-project.sh` 已经会在 `[KEEP]` 分支自动追加 Plan 镜像规则，覆盖绝大多数迁移场景。仅在以下情况手动运行 `inject-plan-mirror.sh`：
-
-- **批量迁移**：用 `--recursive` 扫描一棵目录树（含 `.claude/` 的子目录全部处理）
-- **预览**：用 `--dry-run` 看会改哪些文件，不实际写盘
-- **CI / 定时任务**：在 setup-project.sh 之外的钩子里调用
-
-```bash
-# 单项目
-bash scripts/inject-plan-mirror.sh /path/to/project
-
-# 预览
-bash scripts/inject-plan-mirror.sh --dry-run /path/to/project
-
-# 递归扫描
-bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase
-```
-
-规则块文本与注入函数从 `scripts/plan-mirror-rules.sh` 复用 —— setup-project.sh 和 inject-plan-mirror.sh 共用同一份逻辑，新老项目拿到的规则永远一致。
-
-### 默认 settings.local.json 权限
-
-初始化会创建一个宽松但安全的默认权限配置，允许常见的开发工具链命令：
-
-- 包管理器：npm, npx, yarn, pnpm, bun, pip, pip3
-- 编程语言运行时：node, python, go, cargo, javac, swift
-- 构建工具：xcodebuild, make, cmake, mvn, gradle
-- 版本控制：git
-- 文件操作：ls, cat, find, grep, mkdir, curl
-- 文件读写：Read, Edit, Write
-- 网络：WebFetch, WebSearch
-- CodeGraph：codegraph 命令
-
-用户可以在初始化后根据需要调整权限。
-
-### CodeGraph 集成
-
-技能会自动检测 CodeGraph CLI 是否已安装：
-- **已安装** → 自动运行 `codegraph init` 创建 `.codegraph/` 索引
-- **未安装** → 给出安装提示，初始化其他内容照常进行
-
-## 脚本说明
+## 脚本参考
 
 | 脚本 | 用途 | 退出码 |
 |------|------|--------|
-| `scripts/auto-init.sh` | Hook 入口，协调检测和初始化 | 0=完成/已初始化, 1=非代码项目, 2=错误 |
-| `scripts/detect-code-project.sh` | 检测目录是否是编程项目 | 0=是, 1=否 |
-| `scripts/setup-project.sh` | 执行完整的项目初始化 | 0=成功, 1=失败 |
-| `scripts/teardown-project.sh` | 反向操作：清理 setup 创建的所有产物 | 0=清理完成, 1=无产物/部分失败, 2=用户中止 |
-| `scripts/inject-plan-mirror.sh` | 批量迁移工具：把 Plan 镜像规则追加到已有项目的 `CLAUDE.md`/`AGENTS.md` 末尾 | 0=全部成功, 1=部分失败, 2=参数错误 |
-| `scripts/plan-mirror-rules.sh` | **共享 lib**：Plan 镜像规则块 + `pmr_inject` 函数（被 setup / inject 共同 source） | 不可直接执行 |
+| `scripts/auto-init.sh` | Hook 入口，协调 detect + setup | `0`=完成/已初始化 / `1`=非代码项目 / `2`=错误 |
+| `scripts/detect-code-project.sh` | 编程项目判定 | `0`=是 / `1`=否 |
+| `scripts/setup-project.sh` | 完整项目初始化（additive） | `0`=成功 / `1`=失败 |
+| `scripts/teardown-project.sh` | 反向操作：清理 setup 所有产物 | `0`=清理完成 / `1`=无产物/部分失败 / `2`=用户中止 |
+| `scripts/inject-plan-mirror.sh` | 批量迁移 Plan 镜像规则到已有项目 | `0`=全部成功 / `1`=部分失败 / `2`=参数错误 |
+| `scripts/plan-mirror-rules.sh` | **共享 lib**：Plan 规则块 + `pmr_inject` | 不可直接执行 |
+| `scripts/ci-path.sh` | **共享 lib**：大小写不敏感路径解析 helpers | 不可直接执行 |
 
-## 判断「编程项目」的标准
+---
 
-检测脚本使用宽松策略，以下任一条件满足即判定为编程项目：
+## 检测「编程项目」的标准
 
-1. **包管理标记文件**（优先级最高）
-   - Node.js: `package.json`
-   - iOS/Swift: `Podfile`, `Package.swift`, `*.xcodeproj`, `*.xcworkspace`
-   - Rust: `Cargo.toml`
-   - Go: `go.mod`
-   - Python: `setup.py`, `pyproject.toml`, `requirements.txt`, `Pipfile`
-   - Ruby: `Gemfile`
-   - Java/Kotlin: `pom.xml`, `build.gradle`, `build.gradle.kts`
-   - C/C++: `CMakeLists.txt`, `Makefile`
-   - 等等...
+`detect-code-project.sh` 使用宽松策略，以下任一条件满足即判定为编程项目：
 
-2. **源代码文件数量**（≥ 5 个，或占总文件数 ≥ 5%）
-   - 排除 `node_modules/`, `Pods/`, `vendor/`, `dist/`, `build/` 等依赖/构建目录
+**① 包管理 / 构建系统标记文件**（优先级最高）
 
-3. **`.git` 目录包含代码历史**
+- Node.js: `package.json`
+- iOS / Swift: `Podfile` / `Package.swift` / `*.xcodeproj` / `*.xcworkspace`
+- Rust: `Cargo.toml` · Go: `go.mod` · Python: `setup.py` / `pyproject.toml` / `requirements.txt` / `Pipfile`
+- Ruby: `Gemfile` · JVM: `pom.xml` / `build.gradle` / `build.gradle.kts` / `build.sbt`
+- C/C++: `CMakeLists.txt` / `Makefile` · PHP: `composer.json`
+- Dart: `pubspec.yaml` · Elixir: `mix.exs` · Haskell: `stack.yaml` / `*.cabal`
+- 通用: `Dockerfile` / `docker-compose.yml` / `deno.json[c]` / `bun.lock`
 
-## 非编程项目行为
+**② 源代码文件数量** ≥ 5 个（或 ≥ 总文件数 5%；排除 `node_modules/`、`Pods/`、`vendor/`、`dist/`、`build/`、`__pycache__/` 等依赖 / 构建目录）
 
-当检测到非编程项目时，技能会：
-1. 创建 `CLAUDE.md` 和 `AGENTS.md` 包含友好提示
-2. 提示用户切换到正确的代码项目目录
-3. 不会阻止其他类型的使用（如文档编辑、数据分析等）
+**③ `.git` 目录含代码历史**（用 `git ls-files` 命中任一 `*.swift` / `*.ts` / `*.js` / `*.py` / `*.go` / `*.rs` …）
 
-用户可以手动覆盖：`touch .claude/.init-done`
+---
 
-## 使用 codegraph 初始化
+## 卸载 / 回滚（teardown）
 
-当用户想要为特定项目重新初始化 CodeGraph 时：
+`teardown-project.sh` 是 `setup-project.sh` 的对偶 —— 移除项目中被 project-init 创建的产物，让目录回到 setup 之前的状态。
 
-```bash
-# 检测并初始化
-bash scripts/detect-code-project.sh && bash scripts/setup-project.sh
+**清理范围**：
 
-# 仅重新初始化 CodeGraph
-codegraph init
+| 路径 | 默认行为 |
+|------|---------|
+| `.claude/` / `.codex/` / `.codegraph/` | 只删除 setup manifest 中记录的文件和软连接；目录仅在变空后删除 |
+| 根目录 `CLAUDE.md` / `AGENTS.md` | **仅当**匹配 project-init 指纹才删；用户改过的版本保留并提示 |
+| `.gitignore` | 精确剥离 `# project-init generated local agent files` 块 |
+| `.claude/settings.local.json` | **默认保留**（合并了用户权限）；`--purge-config` 才在指纹匹配时删除 |
 
-# 查看 CodeGraph 状态
-codegraph status
-```
-
-## 卸载 / 清理（teardown）
-
-`teardown-project.sh` 是 `setup-project.sh` 的对偶脚本：移除 project-init 在项目中创建的所有产物，让目录回到 setup 之前的状态。
-
-**清理范围：**
-
-- `.claude/` 整个目录（包含 `settings.local.json`、`progress/`、`plans/`、`skills/`、`rules/`、`commands/`、`.init-done` 等）
-- `.codex/` 整个目录
-- `.codegraph/` 整个目录（已尝试 `codegraph clean`）
-- 根目录 `CLAUDE.md` / `AGENTS.md` —— **仅当**内容匹配 project-init 模板指纹（包含 `This file provides working guidance…` + `## Plan 文件镜像` 等独有片段）；用户改过的版本会保留并提示
-- `.gitignore` —— 精确剥离 `# project-init generated local agent files` 块；如果整文件都是 setup 创建的，直接删除整文件
-- `.claude/settings.local.json` —— **默认保留**（合并了用户权限），加 `--purge-config` 才会在指纹匹配时删除
-
-**使用示例：**
+**使用示例**：
 
 ```bash
-# 交互式（默认会逐项确认）
-bash scripts/teardown-project.sh
-
-# 跳过所有确认
-bash scripts/teardown-project.sh --yes
-
-# 仅审计，不实际删除
-bash scripts/teardown-project.sh --dry-run
-
-# 保留根 CLAUDE.md / AGENTS.md / settings.local.json
-bash scripts/teardown-project.sh --keep-config
-
-# 删除前先打包备份到项目根
-bash scripts/teardown-project.sh --backup --yes
+bash scripts/teardown-project.sh                    # 交互式
+bash scripts/teardown-project.sh --yes              # 跳过确认
+bash scripts/teardown-project.sh --dry-run          # 仅审计
+bash scripts/teardown-project.sh --keep-config      # 保留 CLAUDE.md / AGENTS.md / settings
+bash scripts/teardown-project.sh --purge-config     # 同步移除 settings.local.json
+bash scripts/teardown-project.sh --backup --yes     # 删前打包 .project-init-backup-*.tar.gz
 ```
 
-**安全策略：**
+**安全策略**：
+- 用户改过的文件通过指纹识别，**不匹配默认不动**
+- `--yes` 才删无指纹的"用户内容"，且单独打印 ⚠ 警告
+- `--dry-run` 始终安全
+- 退出码 `2` = 用户中止了 prompt
 
-- 默认对每个可能被用户改过的文件做指纹识别，不匹配就跳过
-- `--yes` 才删除无指纹的"用户内容"文件，且会单独打印 ⚠ 警告
-- `--dry-run` 始终安全，只打印审计结果
-- 退出码 2 表示用户中止了 prompt
+---
 
-## ⚠️ 增量原则（Additive-Only）
+## Additive-Only 原则
 
-初始化脚本遵循**只增不删、只补不改**的原则：
+初始化脚本严格遵守**只增不删、只补不改**：
 
-- **已有文件 → 保留不动**。如果 `CLAUDE.md`、`AGENTS.md`、`PROGRESS.md` 等已存在，**绝不覆盖**
-- **已有 settings.local.json → 智能合并**。只添加缺失的推荐权限和 `plansDirectory` 设置，已有的权限和配置**完全保留**
-- **已有 .codegraph/ → 跳过**。不重复索引
+- **已有文件 → 保留不动**。如果 `CLAUDE.md`、`AGENTS.md` 等已存在，**绝不覆盖**
+- **已有 `settings.local.json` → 智能合并**。只添加缺失的推荐权限和 `plansDirectory` 设置，已有的完全保留
+- **已有 `.codegraph/` → 跳过**。不重复索引
 - **已有目录 → 保留不动**。`mkdir -p` 对已有目录无副作用
-- **只在缺少时才创建**。审计阶段会扫描所有项，报告中会明确标出 `[KEEP]` 保留的和 `[NEW]` 新建的
+- **只在缺少时才创建**。审计阶段会扫描所有项，报告中明确标 `[KEEP]` 保留的与 `[NEW]` 新建的
+- **重复运行 `setup-project.sh` 是安全的**，已存在项一条 `[KEEP]` 之后立即退出，不损坏任何内容
 
-重复运行 `setup-project.sh` 是安全的，不会损坏任何已有内容。
+---
 
-## 注意事项
+## 安装位置与依赖
 
-- 此技能是**用户级技能**，存放在 `~/.claude/skills/project-init/`
-- 自动触发依赖 `SessionStart` hook 配置（在 `settings.local.json` 中）
-- 初始化标记文件 `.claude/.init-done` 确保每个项目只初始化一次
-- CodeGraph 安装失败不会阻塞其他初始化步骤
-- 所有生成的模板文件都包含 `<!-- TODO -->` 标记，需要用户完善
+**位置**：此技能是**用户级技能**，存放在 `~/.claude/skills/project-init/`（或 `~/.codex/skills/project-init/`）。
+
+**自动触发**：依赖 `SessionStart` hook（写在 `settings.local.json` 里），但当前 Claude Code 版本**不读取**该项目级配置，所以现在主要靠 agent 启动时通过关键词识别 / 用户手动触发。
+
+**依赖**：
+- `bash` 3.2+ / `zsh` 兼容（POSIX-sh 兼容）
+- `find`（GNU 或 BSD macOS 10.12+）
+- `python3`（用于 settings.local.json 与 plansDirectory 合并）
+- 可选：`claude` CLI（用于 `/init` 生成 CLAUDE.md；缺失回退到 heredoc 占位）
+- 可选：`codegraph` CLI（缺失则跳过索引创建）
+
+**初始化标记**：`.claude/.init-done` 确保每个项目只初始化一次，文件内容是初始化时间戳（ISO 8601）。
+
+---
+
+## 备注
+
+- 所有生成的模板文件都包含 `<!-- TODO -->` 标记，让用户在第一次见到时知道哪里需要补
+- `assets/commands/` 的命令模板只是**初次安装的种子**，用户完全可以自定义自己的版本覆盖
+- 大小写行为详见 `~/.claude/projects/-Users-zluof-zlf-skills/memory/feedback-skill-case-sensitivity.md`
+- Plan 文件镜像规则详见随仓 `CLAUDE.md` 顶部「Plan 文件镜像（重要）」章节
