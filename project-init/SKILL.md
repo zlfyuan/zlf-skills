@@ -27,6 +27,7 @@ license: MIT
 
 - [概览](#概览)
 - [何时触发](#何时触发)
+- [会话开始检查（禁止大小写幻觉）](#会话开始检查禁止大小写幻觉)
 - [创建的项目结构](#创建的项目结构)
 - [执行流程](#执行流程)
 - [Bundled 斜杠命令](#bundled-斜杠命令)
@@ -81,6 +82,18 @@ license: MIT
 1. `bash scripts/detect-code-project.sh <dir>` —— 判断是否是编程项目
 2. 是 → `bash scripts/setup-project.sh <dir>` —— 增量初始化
 3. 否 → 提示用户切换到正确的代码项目目录（不阻塞工作）
+
+### 会话开始检查（禁止大小写幻觉）
+
+Agent 判定「项目有没有初始化」时，必须遵守：
+
+1. **规范名永远全小写**：`.claude/`、`.codex/`。setup 创建的就是这两个名字。
+2. **禁止把产品名写成路径**。不要检查 `.Codex/`、`.Claude/`、`.CODEX/`。产品叫 Codex，目录叫 `.codex/`。
+3. **检查必须大小写不敏感**。推荐：
+   ```bash
+   find . -maxdepth 1 \( -iname '.claude' -o -iname '.codex' \)
+   ```
+4. **命中 `.codex/` 或 `.claude/` 任一 → 已初始化，继续任务。** 不要因为 `ls .Codex` / Glob `.Codex` 找不到就停下。两者都没有才提醒用户跑 project-init。
 
 ---
 
@@ -296,6 +309,7 @@ bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有�
 - 文档统一小写（`.claude/` `.codex/`）
 - 实际检查大小写不敏感（命中后保留用户原大小写）
 - 已有 case-variant 时复用而非创建平行 `.claude/` / `.codex/` 副本
+- agent 会话开始检查同样遵守此规则（见「何时触发」），禁止把产品名写成 `.Codex/` 再当缺失
 
 ---
 
@@ -465,5 +479,5 @@ bash scripts/teardown-project.sh --backup --yes     # 删前打包 .project-init
 
 - 所有生成的模板文件都包含 `<!-- TODO -->` 标记，让用户在第一次见到时知道哪里需要补
 - `assets/commands/` 的命令模板只是**初次安装的种子**，用户完全可以自定义自己的版本覆盖
-- 大小写行为详见 `~/.claude/projects/-Users-zluof-zlf-skills/memory/feedback-skill-case-sensitivity.md`
+- 大小写行为详见 `.claude/memory/codex-dir-lowercase.md`（规范名 `.codex/`，禁止检查 `.Codex/`）
 - Plan 文件镜像规则详见随仓 `CLAUDE.md` 顶部「Plan 文件镜像（重要）」章节

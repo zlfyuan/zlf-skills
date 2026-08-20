@@ -30,6 +30,25 @@ for pattern in '.claude/' '.codex/' '.codegraph/' 'CLAUDE.md' 'AGENTS.md'; do
     fi
 done
 
+# ── 生成的 AGENTS.md 必须把规范目录写成小写 .codex/ ────────────────
+# Codex 会把产品名幻觉成 `.Codex/`，字面检查会把已初始化项目当成缺失。
+if ! grep -q '\.codex/' "$TMP_DIR/AGENTS.md"; then
+    echo "FAIL: generated AGENTS.md 未提及小写 .codex/" >&2
+    exit 1
+fi
+if ! grep -q '大小写不敏感' "$TMP_DIR/AGENTS.md"; then
+    echo "FAIL: generated AGENTS.md 缺少大小写不敏感检查说明" >&2
+    exit 1
+fi
+if grep -q '检测是否有.Codex/' "$TMP_DIR/AGENTS.md"; then
+    echo "FAIL: generated AGENTS.md 把 .Codex/ 当成检查目标" >&2
+    exit 1
+fi
+if ! grep -q '禁止.*\.Codex/' "$TMP_DIR/AGENTS.md"; then
+    echo "FAIL: generated AGENTS.md 未标明禁止检查 .Codex/" >&2
+    exit 1
+fi
+
 # ── 软连接布局检查 ──────────────────────────────────────────────
 # 1. .codex/AGENTS.md 必须是软连接指向 ../AGENTS.md
 if [[ ! -L "$TMP_DIR/.codex/AGENTS.md" ]]; then

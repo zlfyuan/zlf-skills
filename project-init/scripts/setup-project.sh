@@ -471,13 +471,19 @@ else:
 fi
 
 # ── AGENTS.md (Codex instructions) ──────────────────────────────────────
-# AGENTS_MD 已在 Phase 2 顶部用 ci_canon 解析
+# AGENTS_MD 已在 Phase 2 顶部用 ci_canon 解析。
+# 会话开始检查必须写小写 `.codex/`：Codex 会把产品名幻觉成 `.Codex/`，
+# 在大小写敏感 FS / 字面 glob 上把已初始化的项目当成缺失。
 if [[ ! -f "$AGENTS_MD" ]]; then
     echo "  [NEW] Creating AGENTS.md (Codex)..."
     cat > "$AGENTS_MD" << 'AGENTS_EOF'
 # AGENTS.md
 
 This file provides guidance to Codex and other coding agents working in this repository.
+
+**会话开始之前：**
+
+- 如果是编程相关的项目，检测项目根是否有 `.codex/` 或 `.claude/`（大小写不敏感。规范名全小写 `.codex/` / `.claude/`，禁止把产品名写成 `.Codex/` / `.Claude/` 再当缺失）。命中任一 → 已初始化，继续任务。两者都没有 → 提醒使用 project-init，停止。
 
 ## Project Overview
 
