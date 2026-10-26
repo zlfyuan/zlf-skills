@@ -20,8 +20,39 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # ── Source shared Plan mirror rules + case-insensitive path lib ─────────
 # plan-mirror-rules.sh: 让 setup 与 inject 复用同一份规则块与注入逻辑。
 # ci-path.sh:           在大小写敏感 FS 上复用用户的 .Claude / .Codex 等变体。
+# agents-mirror.sh:     把 CLAUDE.md 的项目约定镜像到 AGENTS.md（Codex 侧）。
 source "$SCRIPT_DIR/plan-mirror-rules.sh"
 source "$SCRIPT_DIR/ci-path.sh"
+source "$SCRIPT_DIR/agents-mirror.sh"
+
+# ── Resolve top-level entry names case-insensitively ──────────────────
+# ci_canon returns the actual on-disk name if a case-variant already exists
+# (e.g. ".Claude"), otherwise the canonical lowercase form (e.g. ".claude").
+# All write targets below use these so we reuse user-existing dirs and never
+# create parallel sibling copies like `.claude/` next to a pre-existing `.Claude/`.
+CLAUDE_DIR="$(ci_canon .claude)"
+CODEX_DIR="$(ci_canon .codex)"
+CODEGRAPH_DIR="$(ci_canon .codegraph)"
+CLAUDE_MD="$TARGET/$(ci_canon CLAUDE.md)"
+AGENTS_MD="$TARGET/$(ci_canon AGENTS.md)"
+SETTINGS_LOCAL="$TARGET/$CLAUDE_DIR/settings.local.json"
+PROGRESS_README="$TARGET/$CLAUDE_DIR/progress/README.md"
+PROBLEMS_MD="$TARGET/$CLAUDE_DIR/progress/problems.md"
+MEMORY_INDEX="$TARGET/$CLAUDE_DIR/memory/MEMORY.md"
+INIT_STDERR_LOG="$TARGET/$CLAUDE_DIR/.init-stderr.log"
+GITIGNORE_FILE="$TARGET/$(ci_canon .gitignore)"
+MANIFEST="$TARGET/$CLAUDE_DIR/.project-init-manifest"
+
+# ── AGENTS.md 同步：模板没动过 + CLAUDE.md 已有真实约定 → 重新镜像 ────────
+# 返回 0 = 已同步；返回 1 = 不满足同步条件（保持原样）
+sync_agents_from_claude() {
+    [[ -f "$AGENTS_MD" ]] || return 1
+    agents_is_untouched_template "$AGENTS_MD" || return 1
+    agents_claude_has_real_content "$CLAUDE_MD" || return 1
+    echo "  [SYNC] AGENTS.md — still an untouched template, refreshing from CLAUDE.md..."
+    agents_mirror "$CLAUDE_MD" "$AGENTS_MD"
+    return 0
+}
 
 # ── Default permissions to ensure ───────────────────────────────────────
 # These are the recommended permissions. If settings.local.json already
@@ -162,6 +193,11 @@ if [[ ${#AUDIT_NEW[@]} -eq 0 ]]; then
     if [[ ! -f "$TARGET/$EXISTING_CLAUDE_DIR/.init-done" ]]; then
         date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TARGET/$EXISTING_CLAUDE_DIR/.init-done"
     fi
+    # 没有新文件可建 ≠ 什么都不用做：AGENTS.md 可能还是没动过的模板，
+    # 而 CLAUDE.md 早已有了真实项目约定 —— 这里补一次同步。
+    if sync_agents_from_claude; then
+        echo "     ✓ AGENTS.md synced from CLAUDE.md"
+    fi
     echo "     (nothing — project already fully initialized)"
     echo ""
     echo "✅ Project already fully set up. Nothing to do."
@@ -180,24 +216,6 @@ echo "🔨 Phase 2: Create missing items"
 
 CREATED=0
 SKIPPED=0
-
-# ── Resolve top-level entry names case-insensitively ──────────────────
-# ci_canon returns the actual on-disk name if a case-variant already exists
-# (e.g. ".Claude"), otherwise the canonical lowercase form (e.g. ".claude").
-# All write targets below use these so we reuse user-existing dirs and never
-# create parallel sibling copies like `.claude/` next to a pre-existing `.Claude/`.
-CLAUDE_DIR="$(ci_canon .claude)"
-CODEX_DIR="$(ci_canon .codex)"
-CODEGRAPH_DIR="$(ci_canon .codegraph)"
-CLAUDE_MD="$TARGET/$(ci_canon CLAUDE.md)"
-AGENTS_MD="$TARGET/$(ci_canon AGENTS.md)"
-SETTINGS_LOCAL="$TARGET/$CLAUDE_DIR/settings.local.json"
-PROGRESS_README="$TARGET/$CLAUDE_DIR/progress/README.md"
-PROBLEMS_MD="$TARGET/$CLAUDE_DIR/progress/problems.md"
-MEMORY_INDEX="$TARGET/$CLAUDE_DIR/memory/MEMORY.md"
-INIT_STDERR_LOG="$TARGET/$CLAUDE_DIR/.init-stderr.log"
-GITIGNORE_FILE="$TARGET/$(ci_canon .gitignore)"
-MANIFEST="$TARGET/$CLAUDE_DIR/.project-init-manifest"
 CREATED_PATHS=()
 
 manifest_record() {
@@ -255,10 +273,32 @@ else
         fi
     done
     if [[ ${#MISSING[@]} -gt 0 ]]; then
-        {
-            printf '\n# project-init generated local agent files\n'
-            printf '%s\n' "${MISSING[@]}"
-        } >> "$GITIGNORE_FILE"
+        if grep -qFxq '# project-init generated local agent files' "$GITIGNORE_FILE"; then
+            # 已有 project-init 块 → 补进那一块，不新起一段
+            # （新起一段会让 .gitignore 出现多个同名块，teardown 难以精确剥离）
+            # 缺失项走 ENVIRON 传进 awk：awk -v 无法安全接收含换行的值
+            AGENTS_GITIGNORE_MISSING="$(printf '%s\n' "${MISSING[@]}")" \
+            awk '
+                BEGIN { n = split(ENVIRON["AGENTS_GITIGNORE_MISSING"], arr, "\n"); done_add = 0 }
+                # 块头 → 紧接着补齐缺失条目（只补第一段，重复块不再追加）
+                /^# project-init generated local agent files$/ {
+                    print
+                    if (!done_add) {
+                        for (i = 1; i <= n; i++) if (arr[i] != "") print arr[i]
+                        done_add = 1
+                    }
+                    next
+                }
+                { print }
+            ' "$GITIGNORE_FILE" > "$GITIGNORE_FILE.tmp" \
+                && cat "$GITIGNORE_FILE.tmp" > "$GITIGNORE_FILE" \
+                && rm -f "$GITIGNORE_FILE.tmp"
+        else
+            {
+                printf '\n# project-init generated local agent files\n'
+                printf '%s\n' "${MISSING[@]}"
+            } >> "$GITIGNORE_FILE"
+        fi
     fi
     SKIPPED=$((SKIPPED + 1))
 fi
@@ -332,6 +372,8 @@ if [[ ! -f "$CLAUDE_MD" ]]; then
         echo "  [NEW] Creating placeholder CLAUDE.md (will be overwritten by 'claude /init' if run later)..."
         cat > "$CLAUDE_MD" << 'CLAUDE_EOF'
 # CLAUDE.md
+
+<!-- project-init: placeholder -->
 
 This file provides working guidance for Claude Code when contributing to this repository.
 
@@ -474,17 +516,25 @@ fi
 # AGENTS_MD 已在 Phase 2 顶部用 ci_canon 解析。
 # 会话开始检查必须写小写 `.codex/`：Codex 会把产品名幻觉成 `.Codex/`，
 # 在大小写敏感 FS / 字面 glob 上把已初始化的项目当成缺失。
+#
+# 同步策略：CLAUDE.md 里已有真实项目约定时，AGENTS.md 由 CLAUDE.md 镜像生成
+# （Codex 侧适配见 agents-mirror.sh）——两份文件各写一遍必然漂移。
+# CLAUDE.md 缺失 / 仍是占位模板 → 退回 project-init 自带模板。
 if [[ ! -f "$AGENTS_MD" ]]; then
-    echo "  [NEW] Creating AGENTS.md (Codex)..."
-    cat > "$AGENTS_MD" << 'AGENTS_EOF'
+    if agents_claude_has_real_content "$CLAUDE_MD"; then
+        echo "  [NEW] Creating AGENTS.md — mirrored from CLAUDE.md..."
+        agents_mirror "$CLAUDE_MD" "$AGENTS_MD"
+    else
+        echo "  [NEW] Creating AGENTS.md (Codex)..."
+        {
+            cat << 'AGENTS_EOF'
 # AGENTS.md
 
 This file provides guidance to Codex and other coding agents working in this repository.
 
-**会话开始之前：**
-
-- 如果是编程相关的项目，检测项目根是否有 `.codex/` 或 `.claude/`（大小写不敏感。规范名全小写 `.codex/` / `.claude/`，禁止把产品名写成 `.Codex/` / `.Claude/` 再当缺失）。命中任一 → 已初始化，继续任务。两者都没有 → 提醒使用 project-init，停止。
-
+AGENTS_EOF
+            printf '%s\n\n' "$AGENTS_SESSION_CHECK"
+            cat << 'AGENTS_EOF'
 ## Project Overview
 
 - Describe the repository purpose and the main workflows for contributors.
@@ -514,15 +564,23 @@ harness 默认把 plan 写到 `~/.claude/plans/<session>.md`（系统路径，�
 
 注：`settings.local.json` 里的 `plansDirectory` 字段是预留配置，当前 harness 版本不读取，仍需通过本规则手动镜像。
 AGENTS_EOF
+        } > "$AGENTS_MD"
+    fi
+    manifest_record "$(basename "$AGENTS_MD")"
+    CREATED=$((CREATED + 1))
+elif agents_is_untouched_template "$AGENTS_MD" && agents_claude_has_real_content "$CLAUDE_MD"; then
+    # AGENTS.md 还是没动过的模板，而 CLAUDE.md 已有真实约定 → 重新同步
+    sync_agents_from_claude
     manifest_record "$(basename "$AGENTS_MD")"
     CREATED=$((CREATED + 1))
 else
     echo "  [KEEP] AGENTS.md — preserving existing content"
     SKIPPED=$((SKIPPED + 1))
-    # 已存在但缺少 Plan 镜像规则 → 自动追加
-    if pmr_inject "$TARGET" "AGENTS.md"; then
-        CREATED=$((CREATED + 1))
-    fi
+fi
+
+# Plan 镜像规则：镜像正文里没有就补上（已有则跳过）
+if pmr_inject "$TARGET" "AGENTS.md"; then
+    CREATED=$((CREATED + 1))
 fi
 
 # ── .codex/AGENTS.md (软连接 → ../AGENTS.md) ────────────────────────────────────
@@ -590,8 +648,16 @@ fi
 # ── CodeGraph initialization ────────────────────────────────────────────
 echo "  → Checking CodeGraph..."
 
-if command -v codegraph &> /dev/null; then
-    echo "    codegraph CLI: $(codegraph --version 2>/dev/null || echo 'ok')"
+# codegraph 官方安装脚本默认装到 ~/.local/bin，但 GUI 启动的 agent 进程常常
+# 没把它带进 PATH（表现为「CLI 未安装」）—— 这里显式补查。
+CODEGRAPH_BIN="$(command -v codegraph 2>/dev/null || true)"
+if [[ -z "$CODEGRAPH_BIN" && -x "$HOME/.local/bin/codegraph" ]]; then
+    CODEGRAPH_BIN="$HOME/.local/bin/codegraph"
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+if [[ -n "$CODEGRAPH_BIN" ]]; then
+    echo "    codegraph CLI: $CODEGRAPH_BIN ($("$CODEGRAPH_BIN" --version 2>/dev/null || echo 'ok'))"
 else
     echo "    ⚠ codegraph CLI is not installed."
     echo "      Install: curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh"
@@ -601,9 +667,9 @@ if [[ -n "$(ci_resolve .codegraph 2>/dev/null)" ]]; then
     echo "  [KEEP] .codegraph/ — already initialized"
     SKIPPED=$((SKIPPED + 1))
 else
-    if command -v codegraph &> /dev/null; then
+    if [[ -n "$CODEGRAPH_BIN" ]]; then
         echo "  [NEW] Running codegraph init..."
-        if codegraph init "$TARGET" 2>&1 | sed 's/^/    /'; then
+        if "$CODEGRAPH_BIN" init "$TARGET" 2>&1 | sed 's/^/    /'; then
             echo "  ✓ CodeGraph initialized"
             manifest_record_tree "$CODEGRAPH_DIR"
             CREATED=$((CREATED + 1))
@@ -818,7 +884,7 @@ echo "✅ Setup complete — $CREATED created, $SKIPPED preserved"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "   Next steps:"
-echo "   1. Edit CLAUDE.md / AGENTS.md with project-specific instructions"
+echo "   1. Put project conventions in CLAUDE.md — AGENTS.md mirrors it for Codex"
 echo "   2. Review .claude/progress/README.md (autonomous dev tracking)"
 echo "   3. Run 'codegraph status' to verify indexing"
 echo "   4. Restart your agent to pick up the new config"

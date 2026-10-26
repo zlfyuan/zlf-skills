@@ -32,7 +32,7 @@
 ```
 <your-project>/
 ├── CLAUDE.md                     # Claude Code 指令（含 Plan 镜像规则）
-├── AGENTS.md                     # Codex / 其他 agent 指令
+├── AGENTS.md                     # Codex / 其他 agent 指令（由 CLAUDE.md 同步生成）
 ├── .gitignore                    # 自动加入 .claude/ .codex/ .codegraph/ 等
 ├── .claude/
 │   ├── settings.local.json       # 默认权限 + plansDirectory
@@ -57,16 +57,31 @@
 | [`scripts/teardown-project.sh`](./scripts/teardown-project.sh) | 反向操作：清理 setup 产物（带指纹识别） | ✓ |
 | [`scripts/inject-plan-mirror.sh`](./scripts/inject-plan-mirror.sh) | 批量迁移：把 Plan 镜像规则追加到已有项目 | ✓ |
 | [`scripts/plan-mirror-rules.sh`](./scripts/plan-mirror-rules.sh) | **共享 lib**：Plan 镜像规则块 + `pmr_inject` 函数 | ✗（仅 source） |
+| [`scripts/agents-mirror.sh`](./scripts/agents-mirror.sh) | **共享 lib**：CLAUDE.md → AGENTS.md 同步（Codex 侧适配） | ✗（仅 source） |
 
 ## 关键设计
 
 ### Additive-Only（只增不删）
 
-- **已有文件 → 保留不动**。`CLAUDE.md` / `AGENTS.md` / `settings.local.json` 等已存在时**绝不覆盖**
+- **已有文件 → 保留不动**。`CLAUDE.md` / `settings.local.json` 等已存在时**绝不覆盖**
 - **`settings.local.json` → 智能合并**。只补缺失的推荐权限，已有权限完全保留
 - **已有目录 → 保留不动**。`mkdir -p` 幂等
 - 重跑 `setup-project.sh` 是安全的
 - teardown 只删除创建清单中的文件和软连接，用户新增内容会保留
+
+### CLAUDE.md → AGENTS.md 同步（Codex 侧复用同一份约定）
+
+项目约定只写一份在 `CLAUDE.md`，`AGENTS.md` 由它镜像生成（`scripts/agents-mirror.sh`）：
+
+| 情况 | 行为 |
+|------|------|
+| `CLAUDE.md` 有真实约定，`AGENTS.md` 不存在 | `[NEW]` 镜像生成 |
+| `AGENTS.md` 仍是没动过的模板，`CLAUDE.md` 有真实约定 | `[SYNC]` 重新镜像 |
+| `AGENTS.md` 已被用户改过 | `[KEEP]` 原样保留 |
+| `CLAUDE.md` 缺失 / 仍是占位模板 | `[NEW]` 退回 project-init 自带模板 |
+
+镜像时的 Codex 侧适配：标题换成 `AGENTS.md`、剔除 Claude 专属内容（`/compact`、`ExitPlanMode`）、
+Plan 镜像规则整段换成 Codex 措辞、`CLAUDE.md` 没有「会话开始之前」检查时补上 Codex 版标准块。
 
 ### Plan 文件镜像（关键）
 
@@ -109,7 +124,7 @@ harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**项目外
 bash tests/test-setup-project.sh
 ```
 
-测试覆盖：fresh project init、idempotent re-run、`.gitignore` 合并、Plan mirror 自动注入等。
+测试覆盖：fresh project init、idempotent re-run、`.gitignore` 合并、Plan mirror 自动注入、CLAUDE→AGENTS 同步与 teardown 剥离等。
 
 ## 安装
 

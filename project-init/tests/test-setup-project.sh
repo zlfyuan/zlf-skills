@@ -6,7 +6,9 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 run_setup() {
-    PATH=/usr/bin:/bin bash "$ROOT_DIR/scripts/setup-project.sh" "$1"
+    # HOME 指到临时目录：避免 setup 命中真实的 ~/.local/bin/codegraph
+    # （那会让测试顺带跑 codegraph init，行为依赖开发机环境）
+    HOME="$TMP_DIR/fakehome" PATH=/usr/bin:/bin bash "$ROOT_DIR/scripts/setup-project.sh" "$1"
 }
 
 run_setup "$TMP_DIR" >/dev/null
@@ -144,7 +146,9 @@ mkdir -p "$CASE_DIR/.Codex" "$CASE_DIR/.CLAUDE"
 run_setup "$CASE_DIR" >/dev/null
 
 # 1. 不能出现平行的 `.codex/` `.claude/` 副本
-if [[ -d "$CASE_DIR/.codex" || -d "$CASE_DIR/.claude" ]]; then
+#    用目录列表做大小写精确比对：macOS 默认文件系统大小写不敏感，
+#    `[[ -d "$CASE_DIR/.codex" ]]` 会把用户的 `.Codex` 也算成命中。
+if ls -a "$CASE_DIR" | grep -Fxq '.codex' || ls -a "$CASE_DIR" | grep -Fxq '.claude'; then
     echo "FAIL: setup 在用户已有的 .Codex/.CLAUDE 旁边又创建了平行副本" >&2
     ls -la "$CASE_DIR" >&2
     exit 1
@@ -219,4 +223,175 @@ for file in "$SAFE_DIR/.claude/keep.txt" "$SAFE_DIR/.codex/keep.txt" "$SAFE_DIR/
 done
 rm -rf "$SAFE_DIR"
 
-echo "setup-project regression checks passed (incl. case-variant reuse)"
+# ── CLAUDE.md → AGENTS.md 同步 ──────────────────────────────────────────
+# 用户已有真实 CLAUDE.md 时，AGENTS.md 应由它镜像生成（Codex 侧适配），
+# 而不是 project-init 的英文占位模板 —— 两份文件各写一遍必然漂移。
+MIRROR_DIR="$(mktemp -d)"
+REFRESH_DIR=""
+trap 'rm -rf "$TMP_DIR" "$CASE_DIR" "$MIRROR_DIR" ${REFRESH_DIR:+"$REFRESH_DIR"}' EXIT
+cat > "$MIRROR_DIR/CLAUDE.md" <<'MIRROR_EOF'
+# CLAUDE.md
+
+**会话开始之前：**
+
+- 检测项目根是否有 `.claude/` 或 `.codex/`（大小写不敏感）。
+
+写代码一定要写注释⚠️
+
+禁止将含有密码、API Key、Token 的代码提交到 Git
+
+## Plan 文件镜像（重要）
+
+harness 默认把 plan 写到 `~/.claude/plans/<session>.md`。
+每次调用 `ExitPlanMode` 之前必须先执行镜像步骤。
+
+<!-- CODEGRAPH_START -->
+
+## CodeGraph
+
+用 `codegraph explore` 查代码。
+<!-- CODEGRAPH_END -->
+MIRROR_EOF
+
+run_setup "$MIRROR_DIR" >/dev/null
+
+# 1. CLAUDE.md 的项目约定必须同步到 AGENTS.md
+if ! grep -qF '写代码一定要写注释' "$MIRROR_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 没有同步 CLAUDE.md 的项目约定" >&2
+    exit 1
+fi
+if ! grep -qF '禁止将含有密码、API Key、Token 的代码提交到 Git' "$MIRROR_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 没有同步 CLAUDE.md 的密钥禁令" >&2
+    exit 1
+fi
+
+# 2. Claude 专属内容必须剔除
+if grep -qF 'ExitPlanMode' "$MIRROR_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 残留 Claude 专属的 ExitPlanMode" >&2
+    exit 1
+fi
+
+# 3. Plan 镜像规则整段换成 Codex 措辞
+if ! grep -qF '每次退出 plan 模式之前' "$MIRROR_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 的 Plan 镜像规则没有换成 Codex 措辞" >&2
+    exit 1
+fi
+
+# 4. CodeGraph 段落要保留
+if ! grep -qF '<!-- CODEGRAPH_START -->' "$MIRROR_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 丢失了 CodeGraph 段落" >&2
+    exit 1
+fi
+
+# 5. 不能残留英文占位模板
+if grep -qF 'Describe the repository purpose' "$MIRROR_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 仍是英文占位模板" >&2
+    exit 1
+fi
+
+# 6. teardown 不得删掉已同步（= 用户内容）的 AGENTS.md
+bash "$ROOT_DIR/scripts/teardown-project.sh" "$MIRROR_DIR" </dev/null >/dev/null 2>&1 || true
+if [[ ! -f "$MIRROR_DIR/AGENTS.md" ]]; then
+    echo "FAIL: teardown 删除了已同步的 AGENTS.md" >&2
+    exit 1
+fi
+rm -rf "$MIRROR_DIR"
+
+# ── AGENTS.md 仍是模板时，重跑 setup 应从 CLAUDE.md 刷新 ────────────────
+REFRESH_DIR="$(mktemp -d)"
+run_setup "$REFRESH_DIR" >/dev/null
+if ! grep -qF 'Describe the repository purpose and the main workflows for contributors.' "$REFRESH_DIR/AGENTS.md"; then
+    echo "FAIL: 没有 CLAUDE.md 时 AGENTS.md 应回退到 project-init 模板" >&2
+    exit 1
+fi
+cat > "$REFRESH_DIR/CLAUDE.md" <<'REFRESH_EOF'
+# CLAUDE.md
+
+项目约定：写代码一定要写注释⚠️
+REFRESH_EOF
+# 第二次跑：没有新文件可建 → 走「已完全初始化」的早退分支，仍必须同步 AGENTS.md
+REFRESH_OUT=$(run_setup "$REFRESH_DIR" 2>&1)
+if ! printf '%s' "$REFRESH_OUT" | grep -qF '[SYNC] AGENTS.md'; then
+    echo "FAIL: 已初始化项目重跑 setup 没有触发 AGENTS.md 同步" >&2
+    exit 1
+fi
+if ! grep -qF '写代码一定要写注释' "$REFRESH_DIR/AGENTS.md"; then
+    echo "FAIL: AGENTS.md 仍是模板时没有从 CLAUDE.md 刷新" >&2
+    exit 1
+fi
+if grep -qF 'Describe the repository purpose' "$REFRESH_DIR/AGENTS.md"; then
+    echo "FAIL: 刷新后 AGENTS.md 仍残留模板占位" >&2
+    exit 1
+fi
+rm -rf "$REFRESH_DIR"
+
+# ── teardown 剥离 .gitignore 块：多段同名块都要清干净 ───────────────────
+GITIGNORE_DIR="$(mktemp -d)"
+# .gitignore 必须在 setup 之前就存在（否则 setup 会把它写进 manifest，
+# teardown 直接删整个文件，就测不到「剥离」这条路径了）。
+# 前两行是用户自己的忽略项 —— 剥离时必须原样保留。
+printf '%s\n' 'node_modules/' '.claude/' '# project-init generated local agent files' '.claude/' '.codex/' '.codegraph/' '' '# project-init generated local agent files' 'CLAUDE.md' 'AGENTS.md' > "$GITIGNORE_DIR/.gitignore"
+run_setup "$GITIGNORE_DIR" >/dev/null
+bash "$ROOT_DIR/scripts/teardown-project.sh" "$GITIGNORE_DIR" --yes >/dev/null 2>&1
+if grep -qF 'project-init generated local agent files' "$GITIGNORE_DIR/.gitignore"; then
+    echo "FAIL: teardown 没剥掉 .gitignore 里的 project-init 块" >&2
+    exit 1
+fi
+if grep -qFxq 'AGENTS.md' "$GITIGNORE_DIR/.gitignore" || grep -qFxq 'CLAUDE.md' "$GITIGNORE_DIR/.gitignore"; then
+    echo "FAIL: teardown 剥离后仍残留 CLAUDE.md / AGENTS.md 条目" >&2
+    exit 1
+fi
+if ! grep -qFxq 'node_modules/' "$GITIGNORE_DIR/.gitignore"; then
+    echo "FAIL: teardown 剥离时误删了用户自己的忽略项" >&2
+    exit 1
+fi
+CLAUDE_IGNORE_COUNT=$(grep -cFx '.claude/' "$GITIGNORE_DIR/.gitignore" || true)
+if [[ "$CLAUDE_IGNORE_COUNT" -ne 1 ]]; then
+    echo "FAIL: teardown 剥离时误删了用户自己的 .claude/ 忽略项" >&2
+    exit 1
+fi
+rm -rf "$GITIGNORE_DIR"
+
+# ── setup 补 .gitignore 缺失条目时不得新起同名块 ───────────────────────
+MERGE_DIR="$(mktemp -d)"
+printf '%s\n' 'node_modules/' '# project-init generated local agent files' '.claude/' '.codex/' '.codegraph/' > "$MERGE_DIR/.gitignore"
+run_setup "$MERGE_DIR" >/dev/null
+BLOCK_COUNT=$(grep -cFx '# project-init generated local agent files' "$MERGE_DIR/.gitignore" || true)
+if [[ "$BLOCK_COUNT" -ne 1 ]]; then
+    echo "FAIL: setup 补缺失条目时新起了第 ${BLOCK_COUNT} 个 project-init 块" >&2
+    exit 1
+fi
+for entry in 'CLAUDE.md' 'AGENTS.md' '.claude/' '.codex/' '.codegraph/'; do
+    if ! grep -Fxq "$entry" "$MERGE_DIR/.gitignore"; then
+        echo "FAIL: setup 后 .gitignore 缺少条目 $entry" >&2
+        exit 1
+    fi
+done
+if ! grep -Fxq 'node_modules/' "$MERGE_DIR/.gitignore"; then
+    echo "FAIL: setup 改动了用户自己的 .gitignore 条目" >&2
+    exit 1
+fi
+rm -rf "$MERGE_DIR"
+
+# ── teardown 不得整份删掉含用户内容的 .gitignore ─────────────────────────
+# 旧判据「文件 ≤ 7 行即认为是 setup 建的」会误删用户自己的忽略项
+# （例：用户原本只有 `node_modules/` 一行，setup 补完条目后刚好 ≤ 7 行）。
+KEEP_DIR="$(mktemp -d)"
+printf 'node_modules/\n' > "$KEEP_DIR/.gitignore"
+run_setup "$KEEP_DIR" >/dev/null
+bash "$ROOT_DIR/scripts/teardown-project.sh" "$KEEP_DIR" --yes >/dev/null 2>&1
+if [[ ! -f "$KEEP_DIR/.gitignore" ]]; then
+    echo "FAIL: teardown 整份删掉了含用户内容的 .gitignore" >&2
+    exit 1
+fi
+if ! grep -Fxq 'node_modules/' "$KEEP_DIR/.gitignore"; then
+    echo "FAIL: teardown 删掉了用户自己的 .gitignore 条目" >&2
+    exit 1
+fi
+if grep -qFxq 'AGENTS.md' "$KEEP_DIR/.gitignore"; then
+    echo "FAIL: teardown 没剥掉 .gitignore 里的 project-init 条目" >&2
+    exit 1
+fi
+rm -rf "$KEEP_DIR"
+
+echo "setup-project regression checks passed (incl. case-variant reuse + CLAUDE→AGENTS sync)"

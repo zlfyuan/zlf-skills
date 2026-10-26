@@ -166,9 +166,11 @@ if [[ -f "$CLAUDE_MD_NAME" ]]; then
 fi
 
 # AGENTS.md — fingerprint check
+# 判据必须是「模板占位句还在」：AGENTS.md 现在可能由 CLAUDE.md 镜像生成，
+# 里面同样有模板抬头文案，只有占位句能区分「没动过的模板」和「有真实内容」。
 if [[ -f "$AGENTS_MD_NAME" ]]; then
     if grep -qF "This file provides guidance to Codex and other coding agents" "$AGENTS_MD_NAME" \
-       && grep -qF "## Plan 文件镜像（重要）" "$AGENTS_MD_NAME"; then
+       && grep -qF "Describe the repository purpose and the main workflows for contributors." "$AGENTS_MD_NAME"; then
         if [[ "$KEEP_CONFIG" == true ]]; then
             SKIP_NOTES+=("$AGENTS_MD_NAME (--keep-config, matches project-init template)")
         else
@@ -224,9 +226,17 @@ GITIGNORE_WHOLE=false
 if [[ -f "$GITIGNORE_NAME" ]]; then
     if grep -qF "# project-init generated local agent files" "$GITIGNORE_NAME"; then
         GITIGNORE_HAS_BLOCK=true
-        # Was the file created entirely by us? Heuristic: file is small (≤ 7 lines)
-        # and contains no content other than the header + 5 entries
-        if [[ $(wc -l < "$GITIGNORE_NAME") -le 7 ]]; then
+        # Was the file created entirely by us? 判据：除块头、5 个已知条目和空行
+        # 之外没有别的内容 —— 只看行数会误删用户自己的忽略项
+        # （例：用户原本只有 `node_modules/` 一行，setup 补条目后刚好 ≤ 7 行）。
+        if awk '
+            /^# project-init generated local agent files$/ { next }
+            $0 == ".claude/" || $0 == ".codex/" || $0 == ".codegraph/" { next }
+            $0 == "CLAUDE.md" || $0 == "AGENTS.md" { next }
+            $0 ~ /^[[:space:]]*$/ { next }
+            { found_other = 1 }
+            END { exit found_other ? 1 : 0 }
+        ' "$GITIGNORE_NAME"; then
             GITIGNORE_WHOLE=true
         fi
     fi
@@ -390,12 +400,29 @@ fi
 if [[ "$GITIGNORE_HAS_BLOCK" == true ]]; then
     if [[ "$GITIGNORE_WHOLE" == true ]]; then
         remove_file "$GITIGNORE_NAME"
+    elif [[ ! -f "$GITIGNORE_NAME" ]]; then
+        : # .gitignore 是 setup 自己建的 → 已随 manifest 删除，无需再剥离
     else
-        # Surgically strip the project-init block (header + 5 entries) from .gitignore.
-        # sed range: from marker line through the next blank-line-just-before-EOF chunk.
-        if sed -i.bak '/^# project-init generated local agent files$/,/^AGENTS\.md$/{/^AGENTS\.md$/d; /^# project-init generated local agent files$/d;}' "$GITIGNORE_NAME" 2>/dev/null \
-            && sed -i.bak '/^$/N;/^\n$/d' "$GITIGNORE_NAME" 2>/dev/null \
-            && rm -f "$GITIGNORE_NAME.bak"; then
+        # 精确剥离 project-init 块（块头 + 其后的已知条目行）。
+        # 用 awk 而不是 sed 区间：用户 .gitignore 里可能存在多段同名块
+        # （setup 每次补齐缺失条目都会新起一段），sed 的「块头 → 下一个
+        # AGENTS.md」区间会把中间块头一起吞掉，结果是条目行残留成孤儿。
+        if awk '
+            BEGIN { skip = 0; after_block = 0 }
+            # 块头
+            /^# project-init generated local agent files$/ { skip = 1; after_block = 1; next }
+            # 块内条目行 → 删除
+            skip == 1 {
+                if ($0 == ".claude/" || $0 == ".codex/" || $0 == ".codegraph/" \
+                    || $0 == "CLAUDE.md" || $0 == "AGENTS.md") { next }
+                skip = 0
+            }
+            # 块后紧跟的空行 → 一并删掉，避免留下空行堆
+            after_block == 1 && $0 ~ /^[[:space:]]*$/ { next }
+            { after_block = 0; print }
+        ' "$GITIGNORE_NAME" > "$GITIGNORE_NAME.tmp" 2>/dev/null \
+            && cat "$GITIGNORE_NAME.tmp" > "$GITIGNORE_NAME" \
+            && rm -f "$GITIGNORE_NAME.tmp"; then
             echo "   ✓ stripped project-init block from $GITIGNORE_NAME"
             REMOVED=$((REMOVED + 1))
         else

@@ -47,7 +47,7 @@ license: MIT
 
 | 维度 | 之前 | 之后 |
 |------|------|------|
-| 项目指令 | 无 / 各家工具各自找 | 根目录 `CLAUDE.md` + `AGENTS.md` + `.claude/CLAUDE.md`、`.codex/AGENTS.md` 软连接 |
+| 项目指令 | 无 / 各家工具各自找 | 根目录 `CLAUDE.md` + `AGENTS.md`（由 CLAUDE.md 镜像生成）+ `.claude/CLAUDE.md`、`.codex/AGENTS.md` 软连接 |
 | 权限 | 全部默认 deny | `.claude/settings.local.json` 带 npm / go / cargo / git / codegraph 等常用白名单 |
 | CodeGraph | 需要手动 `codegraph init` | 自动检测 CLI 并执行 `codegraph init` |
 | Plan 存档 | 写到 `~/.claude/plans/`（项目外，git 看不到） | Plan 镜像规则注入到所有指令文件，强制 cp 到 `.claude/plans/` |
@@ -104,7 +104,7 @@ Agent 判定「项目有没有初始化」时，必须遵守：
 ```text
 project-root/
 ├── CLAUDE.md                 # Claude Code 项目指令（由 `claude /init` 代码库感知生成）
-├── AGENTS.md                 # Codex / 其他代理 项目指令
+├── AGENTS.md                 # Codex / 其他代理 项目指令（由 CLAUDE.md 镜像生成）
 ├── .claude/                  # 主目录 —— 全部实文件，承担 config + 状态存储
 │   ├── CLAUDE.md             # symlink → ../CLAUDE.md
 │   ├── settings.local.json   # 项目级权限配置 + plansDirectory
@@ -230,7 +230,29 @@ claude --bare --permission-mode acceptEdits \
 bash scripts/setup-project.sh "$TARGET"   # 让 Plan 镜像规则被补上
 ```
 
-### 2. Plan 文件镜像规则 —— 自动注入到所有指令文件
+### 2. AGENTS.md 同步 —— 由 CLAUDE.md 镜像生成
+
+项目约定只写一份在 `CLAUDE.md`，`AGENTS.md`（Codex 的入口文件）由它镜像生成 —— 两份文件各维护一遍必然漂移。实现见 `scripts/agents-mirror.sh`。
+
+| 场景 | 行为 |
+|------|------|
+| `CLAUDE.md` 有真实约定，`AGENTS.md` 不存在 | `[NEW]` 镜像生成 |
+| `AGENTS.md` 仍是没动过的模板，`CLAUDE.md` 有真实约定 | `[SYNC]` 重新镜像 |
+| `AGENTS.md` 已被用户改过 | `[KEEP]` 原样保留 |
+| `CLAUDE.md` 缺失 / 仍是占位模板 | `[NEW]` 退回 project-init 自带模板 |
+
+镜像时的 Codex 侧适配：
+
+| 适配项 | 处理 |
+|--------|------|
+| 标题 | `# CLAUDE.md` → `# AGENTS.md` |
+| Claude 专属内容 | `/compact` 斜杠命令、`ExitPlanMode` API 整行剔除 |
+| Plan 镜像规则 | 整段换成 Codex 措辞（`PMR_AGENTS_BLOCK`） |
+| 会话开始检查 | `CLAUDE.md` 里没有就补 Codex 版标准块（规范名全小写 `.codex/`） |
+
+**「没动过的模板」判据**：模板抬头文案 + 模板占位句都还在 → 视为未改动，可安全重新生成；否则一律保留（additive-only）。
+
+### 3. Plan 文件镜像规则 —— 自动注入到所有指令文件
 
 harness 默认把 plan 写到全局 `~/.claude/plans/<session>.md`（**项目外**，git 追踪不到）。即使 `settings.local.json` 配了 `plansDirectory`，当前 Claude Code 版本**不读取**该字段（已实测）。
 
@@ -258,7 +280,7 @@ bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有�
 
 `pmr_inject` 函数 + 规则块文本在共享 lib `scripts/plan-mirror-rules.sh`，setup / inject 共用同一份逻辑。
 
-### 3. 默认 `.claude/settings.local.json` 权限
+### 4. 默认 `.claude/settings.local.json` 权限
 
 合并式创建，缺什么加什么，**不覆盖**已有权限：
 
@@ -271,14 +293,23 @@ bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有�
 - **文件 / 网络**：不自动放行全局文件读写和网络访问，避免意外泄露敏感内容
 - **预留**：`plansDirectory = .claude/plans`（forward-compat，等未来 harness 支持时自动生效）
 
-### 4. CodeGraph 集成
+### 5. CodeGraph 集成
 
 | 状态 | 行为 |
 |------|------|
 | `codegraph` CLI 已安装 | 自动 `codegraph init "$TARGET"` 创建 `.codegraph/` 索引 |
 | 未安装 | 给出 `curl -fsSL ... install.sh | sh` 提示，其它初始化照常进行 |
 
-### 5. 项目级长期记忆 —— `.claude/memory/`
+**PATH 兜底**：`codegraph` 官方安装脚本默认装到 `~/.local/bin`，但 GUI 启动的 agent 进程常常没把它带进 PATH（表现为"CLI 未安装"）。setup 会显式补查 `$HOME/.local/bin/codegraph` 并把它加进 PATH 再调用。
+
+**MCP 侧同一个坑**：`~/.claude.json` 里的 `mcpServers.codegraph.command` 若写裸 `codegraph`，MCP 进程同样会因 PATH 缺失而连不上（报 `ENOENT: Executable not found in $PATH: codegraph`）。两个修法：
+
+- 配绝对路径 `"command": "/Users/<you>/.local/bin/codegraph"`（推荐，不依赖 PATH）
+- 或把 `~/.local/bin/codegraph` 软链到 PATH 里已有的目录（如 `/opt/homebrew/bin/`）
+
+**注意**：CodeGraph 只索引受支持语言的源码（`.ts` / `.py` / `.go` / `.swift` …）。纯 `.md` / `.sh` / `.json` 的仓库会提示 "No supported source files found" —— 这是正常现象，不是安装失败。 |
+
+### 6. 项目级长期记忆 —— `.claude/memory/`
 
 每次 setup 会创建 `.claude/memory/MEMORY.md`（additive：已有则不动）。**MEMORY.md 每次会话开始时加载到上下文**，是 agent 跨 Stage 滚动时仍需复用的"长期事实"。
 
@@ -302,7 +333,7 @@ bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有�
 - 敏感信息：密码 / API key / token
 - 临时性的 chat 内容
 
-### 6. 大小写不敏感路径解析（fix）
+### 7. 大小写不敏感路径解析（fix）
 
 `scripts/ci-path.sh` 共享 lib 提供 `ci_topdir` / `ci_resolve` / `ci_exists` / `ci_canon`，POSIX-sh 兼容（bash / zsh 均可 source）。setup / teardown / inject / detect 都通过它处理 `.Codex/` `.CLAUDE/` 等用户手建变体：
 
@@ -389,6 +420,7 @@ bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有�
 | `scripts/teardown-project.sh` | 反向操作：清理 setup 所有产物 | `0`=清理完成 / `1`=无产物/部分失败 / `2`=用户中止 |
 | `scripts/inject-plan-mirror.sh` | 批量迁移 Plan 镜像规则到已有项目 | `0`=全部成功 / `1`=部分失败 / `2`=参数错误 |
 | `scripts/plan-mirror-rules.sh` | **共享 lib**：Plan 规则块 + `pmr_inject` | 不可直接执行 |
+| `scripts/agents-mirror.sh` | **共享 lib**：CLAUDE.md → AGENTS.md 同步 | 不可直接执行 |
 | `scripts/ci-path.sh` | **共享 lib**：大小写不敏感路径解析 helpers | 不可直接执行 |
 
 ---
@@ -422,8 +454,8 @@ bash scripts/inject-plan-mirror.sh --recursive /path/to/codebase # 扫描所有�
 | 路径 | 默认行为 |
 |------|---------|
 | `.claude/` / `.codex/` / `.codegraph/` | 只删除 setup manifest 中记录的文件和软连接；目录仅在变空后删除 |
-| 根目录 `CLAUDE.md` / `AGENTS.md` | **仅当**匹配 project-init 指纹才删；用户改过的版本保留并提示 |
-| `.gitignore` | 精确剥离 `# project-init generated local agent files` 块 |
+| 根目录 `CLAUDE.md` / `AGENTS.md` | **仅当**匹配 project-init 指纹才删（AGENTS.md 的指纹 = 模板占位句还在）；用户改过的版本保留并提示 |
+| `.gitignore` | 精确剥离 `# project-init generated local agent files` 块（多段同名块也能清干净，用户自己的忽略项不动） |
 | `.claude/settings.local.json` | **默认保留**（合并了用户权限）；`--purge-config` 才在指纹匹配时删除 |
 
 **使用示例**：
@@ -449,7 +481,7 @@ bash scripts/teardown-project.sh --backup --yes     # 删前打包 .project-init
 
 初始化脚本严格遵守**只增不删、只补不改**：
 
-- **已有文件 → 保留不动**。如果 `CLAUDE.md`、`AGENTS.md` 等已存在，**绝不覆盖**
+- **已有文件 → 保留不动**。如果 `CLAUDE.md`、`AGENTS.md` 等已存在，**绝不覆盖**（唯一例外：`AGENTS.md` 还是没动过的模板而 `CLAUDE.md` 已有真实约定 → 重新镜像，见「关键子系统 2」）
 - **已有 `settings.local.json` → 智能合并**。只添加缺失的推荐权限和 `plansDirectory` 设置，已有的完全保留
 - **已有 `.codegraph/` → 跳过**。不重复索引
 - **已有目录 → 保留不动**。`mkdir -p` 对已有目录无副作用
