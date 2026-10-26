@@ -47,6 +47,8 @@
 └── .codegraph/                   # 由 codegraph init 创建
 ```
 
+Claude Code 用 `.claude/commands/*.md`（`/z-commit`）。Codex 不读这个目录。有 `.codex` 时同一步骤写到 `.codex/skills/<name>/SKILL.md`（`$z-commit`）；没有 `.codex` 才写到低优先级的 `.agents/skills/`。
+
 ## 脚本清单
 
 | 脚本 | 用途 | 可独立运行 |

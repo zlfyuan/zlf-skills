@@ -31,6 +31,11 @@ for pattern in '.claude/' '.codex/' '.codegraph/' 'CLAUDE.md' 'AGENTS.md'; do
         exit 1
     fi
 done
+# 有 .codex 时技能放在已被 .codex/ 忽略的目录里，不要再忽略 .agents/skills/。
+if grep -Fq '.agents/skills/' "$TMP_DIR/.gitignore"; then
+    echo "FAIL: 有 .codex 时不应把 .agents/skills/ 写进 .gitignore" >&2
+    exit 1
+fi
 
 # ── 生成的 AGENTS.md 必须把规范目录写成小写 .codex/ ────────────────
 # Codex 会把产品名幻觉成 `.Codex/`，字面检查会把已初始化项目当成缺失。
@@ -88,10 +93,33 @@ for sub in rules skills commands plans progress; do
     fi
 done
 
-# 4. bundled 命令应被安装到 .claude/commands/
+# 4. bundled 命令应被安装到 .claude/commands/。
+# 有 .codex 时 Codex 技能放在 .codex/skills（软链到 .claude/skills），不放 .agents。
 for cmd in z-commit z-push z-commit-push; do
     if [[ ! -f "$TMP_DIR/.claude/commands/$cmd.md" ]]; then
         echo "FAIL: .claude/commands/$cmd.md 未安装" >&2
+        exit 1
+    fi
+    skill="$TMP_DIR/.codex/skills/$cmd/SKILL.md"
+    if [[ ! -f "$skill" ]]; then
+        echo "FAIL: .codex/skills/$cmd/SKILL.md 未安装（Codex 发现不到命令）" >&2
+        exit 1
+    fi
+    if [[ -e "$TMP_DIR/.agents/skills/$cmd" ]]; then
+        echo "FAIL: 已有 .codex 时不应再安装低优先级 .agents/skills/$cmd" >&2
+        exit 1
+    fi
+    if ! grep -q "^name: $cmd$" "$skill"; then
+        echo "FAIL: $skill 缺少 name: $cmd" >&2
+        exit 1
+    fi
+    if ! grep -q '^description: "' "$skill"; then
+        echo "FAIL: $skill 缺少 description" >&2
+        exit 1
+    fi
+    # 正文必须来自命令模板，而不是另一份改写过的步骤
+    if ! grep -q "/$cmd" "$skill"; then
+        echo "FAIL: $skill 没有复用命令模板正文" >&2
         exit 1
     fi
 done
@@ -137,6 +165,53 @@ if [[ ! -f "$TMP_DIR/.claude/memory/MEMORY.md" ]]; then
     exit 1
 fi
 
+# 6b. 用户改过的 Codex skill 不能被第二次 setup 覆盖
+printf 'custom-skill-body\n' > "$TMP_DIR/.codex/skills/z-commit/SKILL.md"
+run_setup "$TMP_DIR" >/dev/null
+if ! grep -q 'custom-skill-body' "$TMP_DIR/.codex/skills/z-commit/SKILL.md"; then
+    echo "FAIL: 第二次 setup 覆盖了用户的 .codex/skills/z-commit/SKILL.md" >&2
+    exit 1
+fi
+
+# 6c. 已初始化项目缺 skill 时，重跑 setup 必须补上（不能在审计阶段提前退出）
+rm -rf "$TMP_DIR/.codex/skills/z-push"
+run_setup "$TMP_DIR" >/dev/null
+if [[ ! -f "$TMP_DIR/.codex/skills/z-push/SKILL.md" ]]; then
+    echo "FAIL: 已初始化项目重跑 setup 没有补上 .codex/skills/z-push" >&2
+    exit 1
+fi
+
+# 6d. 低优先级 .agents 里的同名技能，在 .codex 还没有时搬过去，避免列两次
+rm -rf "$TMP_DIR/.codex/skills/z-commit"
+mkdir -p "$TMP_DIR/.agents/skills/z-commit"
+printf 'moved-from-agents\n' > "$TMP_DIR/.agents/skills/z-commit/SKILL.md"
+run_setup "$TMP_DIR" >/dev/null
+if ! grep -q 'moved-from-agents' "$TMP_DIR/.codex/skills/z-commit/SKILL.md"; then
+    echo "FAIL: 没有把 .agents/skills/z-commit 搬到 .codex/skills" >&2
+    exit 1
+fi
+if [[ -e "$TMP_DIR/.agents/skills/z-commit" ]]; then
+    echo "FAIL: 搬到 .codex 后仍留着内容相同的 .agents 副本" >&2
+    exit 1
+fi
+
+# 6e. 用户改过的 Claude 命令应成为新 skill 的正文
+FLOW_DIR="$(mktemp -d)"
+mkdir -p "$FLOW_DIR/.claude/commands"
+printf 'USER-COMMAND-MARKER\n' > "$FLOW_DIR/.claude/commands/z-commit.md"
+run_setup "$FLOW_DIR" >/dev/null
+if ! grep -q 'USER-COMMAND-MARKER' "$FLOW_DIR/.codex/skills/z-commit/SKILL.md"; then
+    echo "FAIL: Codex skill 没有复用已有的 .claude/commands/z-commit.md" >&2
+    rm -rf "$FLOW_DIR"
+    exit 1
+fi
+if ! grep -q 'USER-COMMAND-MARKER' "$FLOW_DIR/.claude/commands/z-commit.md"; then
+    echo "FAIL: setup 覆盖了用户的 .claude/commands/z-commit.md" >&2
+    rm -rf "$FLOW_DIR"
+    exit 1
+fi
+rm -rf "$FLOW_DIR"
+
 # ── 大小写变体用例：用户已有 `.Codex/` `.CLAUDE/`（非规范小写）──────────
 # setup 应该复用它们，而不是在旁边再创建一个 `.codex/` `.claude/` 平行副本。
 CASE_DIR="$(mktemp -d)"
@@ -157,6 +232,14 @@ fi
 # 2. 既有 .Codex/.CLAUDE 必须被复用并填进内容
 if [[ ! -f "$CASE_DIR/.Codex/AGENTS.md" ]]; then
     echo "FAIL: setup 未在用户已有的 .Codex/ 里写入 AGENTS.md" >&2
+    exit 1
+fi
+if [[ ! -f "$CASE_DIR/.Codex/skills/z-commit/SKILL.md" ]]; then
+    echo "FAIL: 已有 .Codex 时技能应放进 .Codex/skills" >&2
+    exit 1
+fi
+if ls -a "$CASE_DIR" | grep -Fxq '.agents'; then
+    echo "FAIL: 已有 .Codex 时不应创建低优先级 .agents" >&2
     exit 1
 fi
 if [[ ! -f "$CASE_DIR/.CLAUDE/settings.local.json" ]]; then
@@ -206,7 +289,39 @@ if [[ ! -f "$DETECT_DIR/.claude/.init-done" ]]; then
     echo "FAIL: auto-init did not create initialization marker" >&2
     exit 1
 fi
-rm -rf "$DETECT_DIR"
+if [[ ! -f "$DETECT_DIR/.codex/skills/z-commit/SKILL.md" ]]; then
+    echo "FAIL: auto-init 没有安装 Codex skill" >&2
+    exit 1
+fi
+# 已有 .init-done 的旧项目缺 skill 时，hook 不能直接跳过
+rm -rf "$DETECT_DIR/.codex/skills/z-commit"
+if ! PATH=/usr/bin:/bin bash "$ROOT_DIR/scripts/auto-init.sh" "$DETECT_DIR" >/dev/null; then
+    echo "FAIL: auto-init 在已初始化项目上补 Codex skill 失败" >&2
+    exit 1
+fi
+if [[ ! -f "$DETECT_DIR/.codex/skills/z-commit/SKILL.md" ]]; then
+    echo "FAIL: auto-init 没有给已初始化项目补上 Codex skill" >&2
+    exit 1
+fi
+# 没有 .codex 时，低优先级 .agents/skills 算已安装，hook 不应再造一个 .codex
+AGENTS_ONLY="$(mktemp -d)"
+mkdir -p "$AGENTS_ONLY/.claude"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "$AGENTS_ONLY/.claude/.init-done"
+for cmd in z-commit z-push z-commit-push; do
+    mkdir -p "$AGENTS_ONLY/.agents/skills/$cmd"
+    printf 'name: %s\n' "$cmd" > "$AGENTS_ONLY/.agents/skills/$cmd/SKILL.md"
+done
+if ! PATH=/usr/bin:/bin bash "$ROOT_DIR/scripts/auto-init.sh" "$AGENTS_ONLY" >/dev/null; then
+    echo "FAIL: 仅有 .agents 技能时 auto-init 不应失败" >&2
+    rm -rf "$AGENTS_ONLY"
+    exit 1
+fi
+if [[ -d "$AGENTS_ONLY/.codex" || -L "$AGENTS_ONLY/.codex" ]]; then
+    echo "FAIL: 没有 .codex 且 .agents 技能已在时，auto-init 不应新建 .codex" >&2
+    rm -rf "$AGENTS_ONLY"
+    exit 1
+fi
+rm -rf "$DETECT_DIR" "$AGENTS_ONLY"
 
 # ── teardown must preserve pre-existing shared directories ─────────────
 SAFE_DIR="$(mktemp -d)"
@@ -390,6 +505,10 @@ if ! grep -Fxq 'node_modules/' "$KEEP_DIR/.gitignore"; then
 fi
 if grep -qFxq 'AGENTS.md' "$KEEP_DIR/.gitignore"; then
     echo "FAIL: teardown 没剥掉 .gitignore 里的 project-init 条目" >&2
+    exit 1
+fi
+if grep -qFxq '.agents/skills/z-commit/' "$KEEP_DIR/.gitignore"; then
+    echo "FAIL: teardown 没剥掉 Codex skill 的 gitignore 条目" >&2
     exit 1
 fi
 rm -rf "$KEEP_DIR"

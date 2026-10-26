@@ -83,3 +83,16 @@ ci_canon() {
     resolved="$(ci_resolve "$1" 2>/dev/null)" || resolved="$1"
     echo "$resolved"
 }
+
+# ── codex_skill_parent_rel ──────────────────────────────────────────────────
+# Codex 技能放哪。有 .codex（含 .Codex 等大小写变体）时用 <实际目录>/skills，
+# 这是高优先级位置。没有 .codex 才用低优先级目录 .agents/skills。
+# 打印相对 TARGET 的父目录，不含技能名。调用前必须已设置 TARGET。
+codex_skill_parent_rel() {
+    _codex_skill_dir="$(ci_topdir ".codex")"
+    if [ -n "$_codex_skill_dir" ]; then
+        printf '%s\n' "${_codex_skill_dir}/skills"
+    else
+        printf '%s\n' ".agents/skills"
+    fi
+}

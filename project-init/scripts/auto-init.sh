@@ -22,8 +22,31 @@ TARGET="$(cd "$TARGET" && pwd)"
 
 # Resolve the marker case-insensitively so .Claude/.init-done is reused.
 source "$SCRIPT_DIR/ci-path.sh"
+
+# 旧项目在 .init-done 之后才补上 Codex 技能。
+# 有 .codex 时技能应在 .codex/skills；没有 .codex 时看低优先级的 .agents/skills。
+# 标记在且对应位置的技能也在 → 跳过。缺了再跑 setup。补完以后这里会跳过。
+codex_skills_missing=0
+codex_skill_parent="$(codex_skill_parent_rel)"
+if [[ -d "$SCRIPT_DIR/../assets/commands" ]]; then
+    while IFS= read -r cmd_name; do
+        [[ -n "$cmd_name" ]] || continue
+        if [[ ! -e "$TARGET/${codex_skill_parent}/${cmd_name}/SKILL.md" ]]; then
+            codex_skills_missing=1
+            break
+        fi
+    done < <(find "$SCRIPT_DIR/../assets/commands" -maxdepth 1 -type f -name '*.md' -exec basename {} .md \;)
+fi
+
 if [[ -n "$(ci_resolve ".claude/.init-done" 2>/dev/null || true)" ]]; then
-    exit 0
+    if [[ "$codex_skills_missing" -eq 0 ]]; then
+        exit 0
+    fi
+    # 已经初始化过，不必再 detect。只补缺失的 Codex 技能。
+    if "$SCRIPT_DIR/setup-project.sh" "$TARGET"; then
+        exit 0
+    fi
+    exit 2
 fi
 
 if DETECT_OUTPUT="$($SCRIPT_DIR/detect-code-project.sh "$TARGET" 2>/dev/null)"; then

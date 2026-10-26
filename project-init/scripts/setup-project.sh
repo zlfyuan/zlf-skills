@@ -54,6 +54,66 @@ sync_agents_from_claude() {
     return 0
 }
 
+# ── Bundled git 命令：一份正文，两个发现入口 ──────────────────────────
+# assets/commands/<name>.md 是唯一正文。
+# Claude Code 读 .claude/commands/<name>.md，斜杠命令是 /<name>。
+# Codex 不扫描 commands/，也不扫描 .codex/commands/。
+# 技能目录：已有 .codex 时写到 .codex/skills/<name>/SKILL.md（高优先级，
+# 通常是指到 .claude/skills 的软链）。没有 .codex 才写低优先级的 .agents/skills/。
+# 正文仍是这一份命令模板，只包一层 skill frontmatter。
+
+# 打印命令名（不含 .md），排序后逐行输出。没有模板目录时什么都不打印。
+bundled_command_names() {
+    [[ -d "$SKILL_DIR/assets/commands" ]] || return 0
+    find "$SKILL_DIR/assets/commands" -maxdepth 1 -type f -name '*.md' -exec basename {} .md \; | sort
+}
+
+# Codex 靠 description 决定要不要选用该技能，所以每条命令要写清触发说法。
+# 未知命令名走兜底，新增模板也不会从 Codex 的技能列表里消失。
+bundled_skill_description() {
+    case "$1" in
+        z-commit)
+            printf '%s' '把当前 working tree 的改动提交到本地 git，不 push。用户说 /z-commit、提交代码、只 commit 时使用。'
+            ;;
+        z-push)
+            printf '%s' '把当前分支推送到 origin。没有上游时自动 set-upstream，绝不 force push。用户说 /z-push、推送、push 时使用。本地有未提交改动则先停下。'
+            ;;
+        z-commit-push)
+            printf '%s' '先提交当前改动再推送到上游。用户说 /z-commit-push、提交并推送时使用。已有未推送 commit 时跳过 commit，只 push。'
+            ;;
+        *)
+            printf '%s' "项目斜杠命令 /$1。用户显式调用 /$1 时使用。"
+            ;;
+    esac
+}
+
+# .gitignore 条目。命令在 .claude/commands/，有 .codex 时技能在 .codex/skills/，
+# 这两处都已经被整目录忽略。低优先级的 .agents/skills/ 不在这里忽略，
+# 避免把用户自己放在 .agents/skills/ 里的其他技能一并排除。
+project_init_gitignore_entries() {
+    printf '%s\n' '.claude/' '.codex/' '.codegraph/' 'CLAUDE.md' 'AGENTS.md'
+}
+
+# .agents 可能本来就有别的技能。只把本次新建的父目录记入 manifest，
+# teardown 才只会在目录变空后删掉，不会拆用户已有的 .agents/。
+ensure_agents_skills_dir() {
+    if [[ -d "$TARGET/.agents/skills" ]]; then
+        return 0
+    fi
+    if [[ -e "$TARGET/.agents" && ! -d "$TARGET/.agents" ]]; then
+        echo "  [SKIP] .agents/skills — .agents exists but is not a directory" >&2
+        return 1
+    fi
+    if [[ ! -e "$TARGET/.agents" ]]; then
+        mkdir -p "$TARGET/.agents/skills"
+        manifest_record ".agents"
+        manifest_record ".agents/skills"
+        return 0
+    fi
+    mkdir -p "$TARGET/.agents/skills"
+    manifest_record ".agents/skills"
+}
+
 # ── Default permissions to ensure ───────────────────────────────────────
 # These are the recommended permissions. If settings.local.json already
 # exists, missing entries are added; existing entries are preserved.
@@ -165,6 +225,18 @@ check_file ".gitignore"                     ".gitignore"                     || 
 check_file ".claude/settings.local.json"    ".claude/settings.local.json"    || true
 check_file ".claude/memory/MEMORY.md"       ".claude/memory/MEMORY.md"       || true
 
+# Codex 技能缺失时必须进入 Phase 2。安装发生在 .codex 创建之后，
+# 所以目标是 $CODEX_DIR/skills，不是低优先级的 .agents/skills。
+# 用 -e 而不是 ci_resolve：.codex/skills 通常是软链，find 默认不追进去。
+while IFS= read -r cmd_base; do
+    [[ -n "$cmd_base" ]] || continue
+    if [[ -e "$TARGET/$CODEX_DIR/skills/${cmd_base}/SKILL.md" || -L "$TARGET/$CODEX_DIR/skills/${cmd_base}/SKILL.md" ]]; then
+        AUDIT_EXISTING+=("  ✓ $CODEX_DIR/skills/${cmd_base}/SKILL.md — already exists")
+    else
+        AUDIT_NEW+=("  + $CODEX_DIR/skills/${cmd_base}/SKILL.md — will create")
+    fi
+done < <(bundled_command_names)
+
 # Audit codegraph
 if resolved="$(ci_resolve ".codegraph" 2>/dev/null)" && [[ -n "$resolved" ]]; then
     AUDIT_EXISTING+=("  ✓ .codegraph/ — already initialized (at $resolved/)")
@@ -251,23 +323,24 @@ ensure_dir "$TARGET/$CLAUDE_DIR/memory" "$CLAUDE_DIR/memory"
 ensure_dir "$TARGET/$CODEX_DIR" "$CODEX_DIR"
 
 # ── .gitignore ─────────────────────────────────────────────────────────
+GITIGNORE_ENTRIES=()
+while IFS= read -r gitignore_entry; do
+    [[ -n "$gitignore_entry" ]] && GITIGNORE_ENTRIES+=("$gitignore_entry")
+done < <(project_init_gitignore_entries)
+
 if [[ ! -f "$GITIGNORE_FILE" ]]; then
     echo "  [NEW] Creating .gitignore..."
-    cat > "$GITIGNORE_FILE" << 'GITIGNORE_EOF'
-# project-init generated local agent files
-.claude/
-.codex/
-.codegraph/
-CLAUDE.md
-AGENTS.md
-GITIGNORE_EOF
+    {
+        printf '%s\n' '# project-init generated local agent files'
+        printf '%s\n' "${GITIGNORE_ENTRIES[@]}"
+    } > "$GITIGNORE_FILE"
     manifest_record "$(basename "$GITIGNORE_FILE")"
     CREATED=$((CREATED + 1))
 else
     echo "  [MERGE] .gitignore — adding missing ignore rules..."
     touch "$GITIGNORE_FILE"
     MISSING=()
-    for entry in '.claude/' '.codex/' '.codegraph/' 'CLAUDE.md' 'AGENTS.md'; do
+    for entry in "${GITIGNORE_ENTRIES[@]}"; do
         if ! grep -Fxq "$entry" "$GITIGNORE_FILE"; then
             MISSING+=("$entry")
         fi
@@ -628,21 +701,79 @@ for sub in rules skills commands plans progress; do
     fi
 done
 
-# ── 拷贝 bundled 命令模板到 .claude/commands/（additive：已存在不动） ────────
+# ── 安装 bundled 命令：Claude 斜杠命令 + Codex 技能（additive：已存在不动） ──
+# 正文优先用项目里已经存在的 .claude/commands/<name>.md（用户可能改过），
+# 没有才从 assets 拷贝。Codex 技能只在 SKILL.md 不存在时生成。
 if [[ -d "$SKILL_DIR/assets/commands" ]]; then
     mkdir -p "$TARGET/$CLAUDE_DIR/commands"
-    while IFS= read -r -d '' src_cmd; do
-        cmd_name="$(basename "$src_cmd")"
-        target_cmd="$TARGET/$CLAUDE_DIR/commands/$cmd_name"
-        if [[ ! -e "$target_cmd" ]]; then
+    while IFS= read -r cmd_base; do
+        [[ -n "$cmd_base" ]] || continue
+        src_cmd="$SKILL_DIR/assets/commands/${cmd_base}.md"
+        target_cmd="$TARGET/$CLAUDE_DIR/commands/${cmd_base}.md"
+        if [[ ! -e "$target_cmd" && ! -L "$target_cmd" ]]; then
             cp "$src_cmd" "$target_cmd"
-            echo "  [NEW] Installed command: $CLAUDE_DIR/commands/$cmd_name"
-            manifest_record "$CLAUDE_DIR/commands/$cmd_name"
+            echo "  [NEW] Installed command: $CLAUDE_DIR/commands/${cmd_base}.md"
+            manifest_record "$CLAUDE_DIR/commands/${cmd_base}.md"
             CREATED=$((CREATED + 1))
-        else
-            : # 已存在（用户可能已自定义）—— 不覆盖
         fi
-    done < <(find "$SKILL_DIR/assets/commands" -maxdepth 1 -type f -name '*.md' -print0 2>/dev/null)
+
+        # 有 .codex 就放 .codex/skills；没有才落到低优先级的 .agents/skills。
+        # 安装时 .codex 已经建好，正常初始化不会走 .agents。
+        skill_parent_rel="$(codex_skill_parent_rel)"
+        skill_file="$TARGET/${skill_parent_rel}/${cmd_base}/SKILL.md"
+        agents_dir="$TARGET/.agents/skills/${cmd_base}"
+        agents_skill="${agents_dir}/SKILL.md"
+        if [[ -e "$skill_file" || -L "$skill_file" ]]; then
+            :
+        else
+            if [[ "$skill_parent_rel" == ".agents/skills" ]]; then
+                ensure_agents_skills_dir || continue
+            fi
+            # .codex/skills 若是软链，真实目录在 .claude/skills。manifest 记真实路径，
+            # teardown 先删软链时仍能删掉技能目录。
+            if [[ -L "$TARGET/$skill_parent_rel" ]]; then
+                manifest_skill_dir="$CLAUDE_DIR/skills/${cmd_base}"
+            else
+                manifest_skill_dir="${skill_parent_rel}/${cmd_base}"
+            fi
+            if [[ ! -d "$TARGET/$manifest_skill_dir" ]]; then
+                mkdir -p "$TARGET/$manifest_skill_dir"
+                manifest_record "$manifest_skill_dir"
+            fi
+            if [[ "$skill_parent_rel" != ".agents/skills" && -f "$agents_skill" ]]; then
+                # 上一版装在低优先级目录。目标还没有文件时把用户改过的正文搬过来。
+                cp "$agents_skill" "$skill_file"
+                echo "  [NEW] Moved Codex skill .agents/skills/${cmd_base} → ${skill_parent_rel}/${cmd_base}"
+            else
+                {
+                    printf '%s\n' '---'
+                    printf 'name: %s\n' "$cmd_base"
+                    printf 'description: "%s"\n' "$(bundled_skill_description "$cmd_base")"
+                    printf '%s\n' '---'
+                    printf '\n'
+                    # 调用名不同，步骤相同。写在正文开头，避免 Codex 去找 commands 目录。
+                    printf 'Codex 用 `$%s` 调用本技能，步骤与 Claude Code 的 `/%s` 相同。\n\n' "$cmd_base" "$cmd_base"
+                    cat "$target_cmd"
+                } > "$skill_file"
+                echo "  [NEW] Installed Codex skill: ${skill_parent_rel}/${cmd_base}/SKILL.md"
+            fi
+            manifest_record "${manifest_skill_dir}/SKILL.md"
+            CREATED=$((CREATED + 1))
+        fi
+
+        # 高优先级目录里已经有同一份文件时，删掉 .agents 里仅含 SKILL.md 的副本。
+        # 两边内容不同就都留着，避免盖掉用户只改在低优先级目录里的版本。
+        if [[ "$skill_parent_rel" != ".agents/skills" && -f "$agents_skill" && -f "$skill_file" ]] \
+            && cmp -s "$agents_skill" "$skill_file"; then
+            agents_extra="$(find "$agents_dir" -mindepth 1 ! -name 'SKILL.md' -print 2>/dev/null | head -n 1)"
+            if [[ -z "$agents_extra" ]]; then
+                rm -f "$agents_skill"
+                rmdir "$agents_dir" 2>/dev/null || true
+                rmdir "$TARGET/.agents/skills" 2>/dev/null || true
+                rmdir "$TARGET/.agents" 2>/dev/null || true
+            fi
+        fi
+    done < <(bundled_command_names)
 fi
 
 # ── CodeGraph initialization ────────────────────────────────────────────

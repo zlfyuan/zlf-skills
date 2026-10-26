@@ -5,7 +5,7 @@ description: >
   每次启动 Claude Code 或 Codex 时触发 —— 检测当前目录是否是编程项目，
   如果是则自动创建 .claude/ 和 .codex/ 目录结构（.codex/ 全部软连接到 .claude/）、
   初始化 CLAUDE.md / AGENTS.md、.claude/progress/ 状态追踪目录、配置默认权限、
-  安装 /z-commit /z-push /z-commit-push 等斜杠命令模板、添加 CodeGraph MCP 并执行 codegraph init。
+  安装 /z-commit /z-push /z-commit-push（Claude 写入 .claude/commands；有 .codex 时 Codex 写入 .codex/skills，否则写入低优先级的 .agents/skills）、添加 CodeGraph MCP 并执行 codegraph init。
   当用户使用 /loop 或 /goal 命令启动自主开发循环时，触发并强制执行自主开发规则：
   维护 .claude/progress/ 状态追踪（README.md 总索引 + stage-NNN.md 阶段文件 + problems.md 踩坑记录）、
   每个模块编译验证后才能推进、最终用户视角完整测试、
@@ -64,7 +64,8 @@ license: MIT
 
 每次新会话开始时，`auto-init.sh` 检查 `.claude/.init-done`：
 
-- 存在 → 已初始化，跳过
+- 存在，且 Codex 技能已在（有 `.codex` 时看 `.codex/skills/`，否则看低优先级的 `.agents/skills/`）→ 已初始化，跳过
+- 存在，但对应位置的技能还缺 → 再跑一次 `setup-project.sh` 补上
 - 不存在 → `detect-code-project.sh` 判断 → 是编程项目就跑 `setup-project.sh`
 
 ### 手动触发关键词
@@ -123,8 +124,8 @@ project-root/
 ├── .codex/                   # 镜像目录 —— 除 AGENTS.md 外其余都软连接到 .claude/
 │   ├── AGENTS.md             # symlink → ../AGENTS.md
 │   ├── rules/                # symlink → ../.claude/rules
-│   ├── skills/               # symlink → ../.claude/skills
-│   ├── commands/             # symlink → ../.claude/commands
+│   ├── skills/               # symlink → ../.claude/skills（有 .codex 时 z-commit 等技能写在这里）
+│   ├── commands/             # symlink → ../.claude/commands（Codex 不读这个目录）
 │   ├── plans/                # symlink → ../.claude/plans
 │   └── progress/             # symlink → ../.claude/progress
 └── .codegraph/               # CodeGraph 索引数据（由 codegraph init 自动生成）
@@ -132,7 +133,7 @@ project-root/
 
 ### 布局哲学
 
-以 `.claude/` 为唯一**真实**存储（实文件 = 全部 config 和状态），`.codex/` 通过软连接复用 —— 两边工具读到的总是同一份内容，杜绝"两份实例的不一致"。
+以 `.claude/` 为 config 和状态的真实存储，`.codex/` 通过软连接复用。Codex 不读 `.claude/commands/`。有 `.codex` 时，同一份命令正文写到 `.codex/skills/<name>/SKILL.md`（经 skills 软链落在 `.claude/skills/`）。没有 `.codex` 才用低优先级目录 `.agents/skills/`。
 
 **唯一例外**：`.codex/AGENTS.md` 和 `.claude/CLAUDE.md` 是对方工具在自己目录下寻找入口文件的"门面"，它们通过软连接指向项目根的 `AGENTS.md` / `CLAUDE.md`。
 
@@ -147,7 +148,8 @@ project-root/
 ```text
 ┌─────────────────────────────┐
 │  检查 .claude/.init-done    │
-│  ├─ 存在 → 已完成，跳过     │
+│  ├─ 在且 Codex 技能在 → 跳过│
+│  ├─ 在但技能缺 → setup 补齐 │
 │  └─ 不存在 → 继续判定       │
 └─────────────┬───────────────┘
               ▼
@@ -180,7 +182,17 @@ project-root/
 
 ## Bundled 斜杠命令
 
-`project-init` 在 setup 时把以下三条 git 快捷命令模板从 `assets/commands/` 拷贝到目标项目的 `.claude/commands/`：
+`project-init` 在 setup 时把 `assets/commands/` 里的三条模板装到两个入口。正文只维护一份：
+
+| 工具 | 安装位置 | 怎么调用 |
+|------|----------|----------|
+| Claude Code | `.claude/commands/<name>.md` | `/z-commit`、`/z-push`、`/z-commit-push` |
+| Codex（有 `.codex`，含 `.Codex` 等大小写变体） | `.codex/skills/<name>/SKILL.md` | `$z-commit`、`$z-push`、`$z-commit-push` |
+| Codex（没有 `.codex`） | `.agents/skills/<name>/SKILL.md` | 同上，低优先级 |
+
+Codex 不扫描 `.claude/commands/`，也不扫描 `.codex/commands/`。有 `.codex` 时技能放在 `.codex/skills/`（project-init 里这个目录软链到 `.claude/skills/`）。`.agents/skills/` 只在项目没有 `.codex` 时使用。两边内容相同的副本不会各留一份，避免 Codex 把同一个命令列两次。
+
+三条命令的行为：
 
 | 命令 | 行为 |
 |------|------|
@@ -503,7 +515,7 @@ bash scripts/teardown-project.sh --backup --yes     # 删前打包 .project-init
 - 可选：`claude` CLI（用于 `/init` 生成 CLAUDE.md；缺失回退到 heredoc 占位）
 - 可选：`codegraph` CLI（缺失则跳过索引创建）
 
-**初始化标记**：`.claude/.init-done` 确保每个项目只初始化一次，文件内容是初始化时间戳（ISO 8601）。
+**初始化标记**：`.claude/.init-done` 让 hook 不必每次重审，内容是初始化时间戳（ISO 8601）。对应位置的 Codex 技能还缺时会再跑一次 setup 补齐。有 `.codex` 时看 `.codex/skills/`，否则看 `.agents/skills/`。
 
 ---
 

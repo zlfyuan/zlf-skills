@@ -226,13 +226,18 @@ GITIGNORE_WHOLE=false
 if [[ -f "$GITIGNORE_NAME" ]]; then
     if grep -qF "# project-init generated local agent files" "$GITIGNORE_NAME"; then
         GITIGNORE_HAS_BLOCK=true
-        # Was the file created entirely by us? 判据：除块头、5 个已知条目和空行
+        # Was the file created entirely by us? 判据：除块头、已知条目和空行
         # 之外没有别的内容 —— 只看行数会误删用户自己的忽略项
         # （例：用户原本只有 `node_modules/` 一行，setup 补条目后刚好 ≤ 7 行）。
+        # 旧版曾把 Codex 技能装在 .agents/skills/<name>/ 并写入忽略项。
+        # 现在有 .codex 时技能放 .codex/skills（已被 .codex/ 忽略）。
+        # 这里仍认旧忽略行，避免 teardown 把只含这些行的 gitignore 误判成用户文件。
+        # 用字符串正则，不用 /.../ 字面量：BSD awk 会把 [^/] 里的 / 当成正则结束符。
         if awk '
             /^# project-init generated local agent files$/ { next }
             $0 == ".claude/" || $0 == ".codex/" || $0 == ".codegraph/" { next }
             $0 == "CLAUDE.md" || $0 == "AGENTS.md" { next }
+            $0 ~ "^\\.agents/skills/[^/]+/$" { next }
             $0 ~ /^[[:space:]]*$/ { next }
             { found_other = 1 }
             END { exit found_other ? 1 : 0 }
@@ -413,8 +418,11 @@ if [[ "$GITIGNORE_HAS_BLOCK" == true ]]; then
             /^# project-init generated local agent files$/ { skip = 1; after_block = 1; next }
             # 块内条目行 → 删除
             skip == 1 {
+                # 旧版 .agents/skills/<name>/ 忽略项。匹配用字符串正则，
+                # 避免 BSD awk 把 [^/] 里的 / 当成 /.../ 的结束符。
                 if ($0 == ".claude/" || $0 == ".codex/" || $0 == ".codegraph/" \
-                    || $0 == "CLAUDE.md" || $0 == "AGENTS.md") { next }
+                    || $0 == "CLAUDE.md" || $0 == "AGENTS.md" \
+                    || $0 ~ "^\\.agents/skills/[^/]+/$") { next }
                 skip = 0
             }
             # 块后紧跟的空行 → 一并删掉，避免留下空行堆
